@@ -52,7 +52,11 @@ class Code2WavStreamState:
     num_samples: int = 0
     slot_index: int | None = None
     stream_done: bool = False
-    last_decode_step_index: int = 0
+    # Position in the ready queue: stamped when the request gains its first
+    # pending chunk and again after each decode step that leaves it with
+    # pending work. Lower runs first, so a new arrival queues behind every
+    # stream already waiting instead of jumping ahead of it.
+    ready_order: int = 0
 
 
 class PersonaPlexCode2WavScheduler(StreamingSimpleScheduler):
@@ -67,7 +71,7 @@ class PersonaPlexCode2WavScheduler(StreamingSimpleScheduler):
         super().__init__(compute_fn, max_batch_size=max_batch_size)
         self.codec = codec
         self.stream_states: dict[str, Code2WavStreamState] = {}
-        self.decode_step_index = 0
+        self.next_ready_order = 0
         stream_slot_count = max(int(stream_slots), 1)
         self.decode_arena = MimiDecodeStateArena(codec, stream_slot_count)
         self.free_slot_indices = list(reversed(range(stream_slot_count)))
@@ -144,12 +148,20 @@ class PersonaPlexCode2WavScheduler(StreamingSimpleScheduler):
             state.num_samples = num_samples
         else:
             pass
+        if not state.pending_chunks:
+            self.stamp_ready_order(state)
+        else:
+            pass
         state.pending_chunks.append(
             torch.as_tensor(
                 stream_item.data, dtype=torch.long, device=self.codec.device
             )
         )
         return state
+
+    def stamp_ready_order(self, state: Code2WavStreamState) -> None:
+        state.ready_order = self.next_ready_order
+        self.next_ready_order += 1
 
     @torch.inference_mode()
     def on_stream_chunk(
@@ -160,9 +172,10 @@ class PersonaPlexCode2WavScheduler(StreamingSimpleScheduler):
         return self.decode_slot_batch([(request_id, state)])
 
     def on_stream_chunk_batch(self, items: list[tuple[str, StreamItem]]) -> None:
-        """Ingest chunks, then run one decode step so sustained message
-        arrival cannot postpone decode work."""
+        """Ingest chunks, then decode at least as many chunks as were
+        ingested, so sustained message arrival cannot grow the backlog."""
         failed_request_ids: list[str] = []
+        ingested_chunks = 0
         with self.state_lock:
             for request_id, stream_item in items:
                 if self.is_aborted(request_id):
@@ -175,9 +188,23 @@ class PersonaPlexCode2WavScheduler(StreamingSimpleScheduler):
                     self.emit_error(request_id, error)
                     self.abort_state(request_id)
                     failed_request_ids.append(request_id)
+                else:
+                    ingested_chunks += 1
         for request_id in failed_request_ids:
             self.cleanup_aborted_request(request_id)
-        self.run_ready_step()
+        # Note (nightdecode): One step per message batch is not enough: a batch
+        # may carry several chunks of one request, and a step serves only one
+        # compatible group. Decoding at least the ingested count keeps the
+        # total backlog from growing while the inbox stays non-empty; the
+        # extra steps are bounded by the batch size.
+        decoded_chunks = 0
+        while True:
+            step_chunks = self.run_decode_step()
+            decoded_chunks += step_chunks
+            if step_chunks == 0 or decoded_chunks >= ingested_chunks:
+                break
+            else:
+                pass
 
     def has_ready_work(self) -> bool:
         with self.state_lock:
@@ -197,23 +224,27 @@ class PersonaPlexCode2WavScheduler(StreamingSimpleScheduler):
                 pass
         compatible_state_groups = list(compatible_groups.values())
         for compatible_states in compatible_state_groups:
-            compatible_states.sort(key=lambda entry: entry[1].last_decode_step_index)
+            compatible_states.sort(key=lambda entry: entry[1].ready_order)
         if not compatible_state_groups:
             return []
         else:
             pass
         selected_group = min(
             compatible_state_groups,
-            key=lambda group: group[0][1].last_decode_step_index,
+            key=lambda group: group[0][1].ready_order,
         )
         return selected_group[: self.max_batch_size]
 
     def run_ready_step(self) -> None:
+        self.run_decode_step()
+
+    def run_decode_step(self) -> int:
+        """Run one batched decode step; return the number of chunks consumed."""
         failed_request_ids: list[str] = []
         with self.state_lock:
             participants = self.select_step_participants()
             if not participants:
-                return
+                return 0
             else:
                 pass
             try:
@@ -246,6 +277,7 @@ class PersonaPlexCode2WavScheduler(StreamingSimpleScheduler):
                         pass
         for request_id in failed_request_ids:
             self.cleanup_aborted_request(request_id)
+        return len(participants)
 
     def chunk_batch_key(self, state: Code2WavStreamState) -> tuple[int, bool]:
         slot_index = state.slot_index
@@ -276,10 +308,12 @@ class PersonaPlexCode2WavScheduler(StreamingSimpleScheduler):
         waveform_batch = self.decode_arena.decode_step(
             batched_codes, slot_indices=concrete_slot_indices
         )
-        self.decode_step_index += 1
         for _, state in participants:
             state.pending_chunks.popleft()
-            state.last_decode_step_index = self.decode_step_index
+            if state.pending_chunks:
+                self.stamp_ready_order(state)
+            else:
+                pass
         if get_recorder().is_active():
             emit_event(
                 request_id=participants[0][0],
@@ -317,6 +351,9 @@ class PersonaPlexCode2WavScheduler(StreamingSimpleScheduler):
             ]
         else:
             pass
+        # Note (nightdecode): The row is a view into the whole batch's host
+        # tensor; clone it so a long stream does not pin every batch it joined.
+        waveform = waveform.clone()
         state.emitted_samples += waveform.shape[-1]
         state.audio_parts.append(waveform)
         return OutgoingMessage(

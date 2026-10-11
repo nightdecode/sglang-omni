@@ -768,3 +768,173 @@ def test_config_enables_batching_by_default(random_codec: MimiCodec) -> None:
     assert scheduler.decode_arena.slot_count == 16
     assert scheduler.can_batch_stream_chunks
     assert scheduler.stream_chunk_batch_max == 8
+
+
+def pending_depth(scheduler) -> int:
+    return sum(len(state.pending_chunks) for state in scheduler.stream_states.values())
+
+
+def test_sustained_multi_chunk_batches_do_not_grow_the_backlog(
+    random_codec: MimiCodec,
+) -> None:
+    # Each call stands for one message batch while the inbox never drains, so
+    # the ready-work branch never runs between calls. A batch carries several
+    # chunks of the same request, and the two requests use different chunk
+    # widths, so they never share a step.
+    codec = random_codec
+    rounds = 3
+    scheduler = PersonaPlexCode2WavScheduler(
+        codec,
+        compute_fn=lambda payload: payload,
+        max_batch_size=8,
+        stream_slots=2,
+    )
+    codes = {"a": random_codes(4 * rounds, 71), "b": random_codes(8 * rounds, 72)}
+    for request_id in codes:
+        start_stream(scheduler, request_id)
+
+    depths = []
+    for round_index in range(rounds):
+        items = [
+            (
+                "a",
+                SimpleNamespace(
+                    data=codes["a"][4 * round_index + i : 4 * round_index + i + 1],
+                    metadata=None,
+                ),
+            )
+            for i in range(4)
+        ] + [
+            (
+                "b",
+                SimpleNamespace(
+                    data=codes["b"][
+                        8 * round_index + 2 * i : 8 * round_index + 2 * i + 2
+                    ],
+                    metadata=None,
+                ),
+            )
+            for i in range(4)
+        ]
+        scheduler.on_stream_chunk_batch(items)
+        depths.append(pending_depth(scheduler))
+    # One step per message batch would leave 7, 14, 21 chunks pending here.
+    assert depths == [0] * rounds
+
+    streamed: dict[str, list[torch.Tensor]] = {"a": [], "b": []}
+    for message in drain_outbox(scheduler):
+        assert message.type == "stream"
+        streamed[message.request_id].append(decode_waveform(message.data))
+    for request_id, request_codes in codes.items():
+        expected = codec.decode(request_codes.T[None])[0, 0].cpu()
+        torch.testing.assert_close(
+            torch.cat(streamed[request_id]), expected, rtol=1e-5, atol=1e-5
+        )
+        (result,) = scheduler.on_stream_done(request_id)
+        torch.testing.assert_close(
+            decode_waveform(result.data.data), expected, rtol=1e-5, atol=1e-5
+        )
+    assert scheduler.active_slot_count == 0
+
+
+def test_new_arrivals_cannot_starve_a_backlogged_stream(
+    random_codec: MimiCodec,
+) -> None:
+    scheduler = PersonaPlexCode2WavScheduler(
+        random_codec,
+        compute_fn=lambda payload: payload,
+        max_batch_size=2,
+        stream_slots=3,
+    )
+    long_codes = random_codes(6, 61)
+    start_stream(scheduler, "long")
+    feed_batched(scheduler, [("long", long_codes[0:1])])  # now in steady state
+    with scheduler.state_lock:
+        for frame in range(1, 6):
+            scheduler.ingest_chunk(
+                "long",
+                SimpleNamespace(data=long_codes[frame : frame + 1], metadata=None),
+            )
+
+    long_decode_steps: list[int] = []
+    short_wait_steps: dict[str, int] = {}
+    for step in range(10):
+        # A fresh one-chunk request arrives before every step: the worst case
+        # for a policy that favours first-step requests.
+        short_id = f"short-{step}"
+        start_stream(scheduler, short_id)
+        with scheduler.state_lock:
+            scheduler.ingest_chunk(
+                short_id,
+                SimpleNamespace(data=random_codes(1, 100 + step), metadata=None),
+            )
+        short_wait_steps[short_id] = step
+        scheduler.run_ready_step()
+        for message in drain_outbox(scheduler):
+            assert message.type == "stream"
+            if message.request_id == "long":
+                long_decode_steps.append(step)
+            else:
+                short_wait_steps[message.request_id] = (
+                    step - short_wait_steps[message.request_id]
+                )
+                assert scheduler.on_stream_done(message.request_id)
+
+    # The backlogged stream is served every other step despite the churn.
+    assert long_decode_steps == [0, 2, 4, 6, 8]
+    assert not scheduler.stream_states["long"].pending_chunks
+    # Arrivals still get their first step within one step of arriving.
+    assert all(wait <= 1 for wait in short_wait_steps.values())
+
+
+def test_streamed_audio_parts_do_not_pin_the_batch_buffer(
+    random_codec: MimiCodec,
+) -> None:
+    scheduler = PersonaPlexCode2WavScheduler(
+        random_codec,
+        compute_fn=lambda payload: payload,
+        max_batch_size=4,
+        stream_slots=4,
+    )
+    request_ids = ["a", "b", "c"]
+    for request_id in request_ids:
+        start_stream(scheduler, request_id)
+    batch_sizes = record_decode_steps(scheduler)
+    scheduler.on_stream_chunk_batch(
+        [
+            (
+                request_id,
+                SimpleNamespace(
+                    data=random_codes(1, 80 + index),
+                    # a is trimmed to its caller length inside the step.
+                    metadata={"num_samples": 1000} if request_id == "a" else None,
+                ),
+            )
+            for index, request_id in enumerate(request_ids)
+        ]
+    )
+    assert batch_sizes == [3]
+    for request_id in request_ids:
+        (part,) = scheduler.stream_states[request_id].audio_parts
+        expected_samples = 1000 if request_id == "a" else SAMPLES_PER_FRAME
+        assert part.shape[-1] == expected_samples
+        # Each part owns exactly its own samples, not the 3-row batch tensor.
+        assert part.untyped_storage().nbytes() == part.numel() * part.element_size()
+
+
+def test_config_rejects_fewer_stream_slots_than_lm_running_requests() -> None:
+    def config_data(max_running_requests: int, stream_slots: int) -> dict:
+        data = PersonaPlexPipelineConfig(model_path="unused").model_dump()
+        for stage in data["stages"]:
+            if stage["name"] == "lm":
+                stage["engine"]["max_running_requests"] = max_running_requests
+            elif stage["name"] == CODE2WAV_STAGE:
+                stage["factory"]["stream_slots"] = stream_slots
+            else:
+                pass
+        return data
+
+    with pytest.raises(ValueError, match="stream_slots"):
+        PersonaPlexPipelineConfig.model_validate(config_data(32, 16))
+    PersonaPlexPipelineConfig.model_validate(config_data(16, 16))
+    PersonaPlexPipelineConfig.model_validate(config_data(32, 32))

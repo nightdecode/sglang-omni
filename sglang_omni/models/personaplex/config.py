@@ -82,10 +82,6 @@ class PersonaPlexPipelineConfig(PipelineConfig):
         CODE2WAV_STAGE: PersonaPlexCode2WavStageConfig,
     }
 
-    @classmethod
-    def code2wav_stage(cls) -> str:
-        return CODE2WAV_STAGE
-
     model_path: str
     placement: PlacementConfig = Field(
         default_factory=lambda: PlacementConfig(
@@ -93,6 +89,37 @@ class PersonaPlexPipelineConfig(PipelineConfig):
         )
     )
     stages: list[StageConfig] = Field(default_factory=personaplex_stages_factory)
+
+    def model_post_init(self, __context: object = None) -> None:
+        super().model_post_init(__context)
+        self.validate_code2wav_capacity()
+
+    def validate_code2wav_capacity(self) -> None:
+        """Every LM request streams into its own code2wav decode slot, so fewer
+        slots than LM running requests turns admitted requests into 503s."""
+        stages = {stage.name: stage for stage in self.stages}
+        lm_stage = stages.get(LM_STAGE)
+        code2wav_stage = stages.get(CODE2WAV_STAGE)
+        if lm_stage is None or code2wav_stage is None:
+            return
+        else:
+            pass
+        engine = getattr(lm_stage, "engine", None)
+        max_running = engine.max_running_requests if engine is not None else None
+        stream_slots = getattr(code2wav_stage.factory, "stream_slots", None)
+        if max_running is None or stream_slots is None:
+            return
+        else:
+            pass
+        if stream_slots < max_running:
+            raise ValueError(
+                f"{CODE2WAV_STAGE}.factory.stream_slots={stream_slots} is below "
+                f"{LM_STAGE}.engine.max_running_requests={max_running}: every "
+                "running LM request needs its own code2wav decode slot. Raise "
+                "stream_slots to at least max_running_requests."
+            )
+        else:
+            pass
 
 
 EntryClass = PersonaPlexPipelineConfig
