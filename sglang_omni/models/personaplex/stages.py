@@ -216,7 +216,7 @@ def create_code2wav_executor(
     *,
     device: str | None = None,
     gpu_id: int | None = None,
-    chunk_ramp_frames: list[int] | tuple[int, ...] = (1, 4),
+    chunk_ramp_frames: list[int],
     **_,
 ) -> PersonaPlexCode2WavScheduler:
     codec, device = load_codec(model_path, device=device, gpu_id=gpu_id)

@@ -45,6 +45,7 @@ def apply_interleaved_rope(
 class AttentionState:
     """The reference's ring cache: a fixed buffer written modulo its capacity."""
 
+    max_chunk_steps: int
     keys: torch.Tensor | None = None
     values: torch.Tensor | None = None
     end_offset: int = 0
@@ -82,39 +83,26 @@ class MimiAttention(nn.Module):
         q, k = apply_interleaved_rope(q, k, pos_q, self.max_period)
         if state is None:
             pos_k = pos_q
-            delta = pos_q.view(-1, 1) - pos_k.view(1, -1)
-            # Note (wilsonzheng0327): The reference writes a whole chunk into its ring
-            # before attending, and once the ring is full it labels the slot at the
-            # write cursor as a future position. So a query sees only the keys
-            # newer than cursor - context, the cursor taken after its own chunk:
-            # the plain window until the ring fills, one to two keys fewer after.
-            # A partial last chunk only advances the cursor by what it holds.
-            # As a rule over positions this is one batched attention that matches
-            # the frame-by-frame ring bit for bit.
-            cursor = ((pos_q // self.write_chunk + 1) * self.write_chunk).clamp(
-                max=offset + length
-            )
-            mask = (delta >= 0) & (
-                pos_k.view(1, -1) > (cursor - self.context).view(-1, 1)
-            )
         else:
             pos_k = self.write_ring(k, v, state)
             k, v = state.keys, state.values
-            delta = pos_q.view(-1, 1) - pos_k.view(1, -1)
-            mask = (pos_k.view(1, -1) >= 0) & (delta >= 0) & (delta < self.context)
+        cursor = ((pos_q // self.write_chunk + 1) * self.write_chunk).clamp(
+            max=offset + length
+        )
+        mask = (
+            (pos_k.view(1, -1) >= 0)
+            & (pos_q.view(-1, 1) >= pos_k.view(1, -1))
+            & (pos_k.view(1, -1) > (cursor - self.context).view(-1, 1))
+        )
         out = functional.scaled_dot_product_attention(q, k, v, attn_mask=mask)
         return self.out_proj(rearrange(out, "b h t d -> b t (h d)"))
 
     def write_ring(
         self, k: torch.Tensor, v: torch.Tensor, state: AttentionState
     ) -> torch.Tensor:
-        """Store this step in the ring and label every slot as the reference does.
-
-        The slot about to be overwritten is labelled as a future position, so
-        once the ring is full its oldest entry falls outside the window; the
-        non-streaming mask in forward applies the same rule without the ring.
-        """
-        capacity = self.context
+        """Write a chunk and return each slot's absolute position (-1 if unwritten)."""
+        # note (nightdecode): A chunk is written before it attends, so leave room for it.
+        capacity = self.context + state.max_chunk_steps
         if state.keys is None:
             shape = (k.shape[0], k.shape[1], capacity, k.shape[3])
             state.keys, state.values = k.new_zeros(shape), v.new_zeros(shape)
@@ -128,7 +116,7 @@ class MimiAttention(nn.Module):
         indexes = torch.arange(capacity, device=k.device)
         delta = indexes - state.end_offset % capacity
         positions = torch.where(
-            delta <= 0,
+            delta < 0,
             state.end_offset + delta,
             state.end_offset + delta - capacity,
         )
@@ -196,8 +184,12 @@ class MimiTransformer(StreamingModule):
             x = layer(x)
         return x.transpose(1, 2)
 
-    def init_state(self) -> TransformerState:
-        return TransformerState(layers=[AttentionState() for _ in self.layers])
+    def init_state(self, *, max_chunk_steps: int) -> TransformerState:
+        return TransformerState(
+            layers=[
+                AttentionState(max_chunk_steps=max_chunk_steps) for _ in self.layers
+            ]
+        )
 
     def step(self, x: torch.Tensor, state: TransformerState) -> torch.Tensor:
         x = x.transpose(1, 2)

@@ -174,7 +174,7 @@ def test_whole_reply_decode_is_cut_back_to_the_caller_length(monkeypatch):
             )
 
     monkeypatch.setattr(stages, "load_codec", lambda *a, **k: (_Codec(), "cpu"))
-    scheduler = stages.create_code2wav_executor("m")
+    scheduler = stages.create_code2wav_executor("m", chunk_ramp_frames=[1, 4])
     state = PersonaPlexState(
         num_samples=num_samples, codes=torch.zeros(frames, 8, dtype=torch.long)
     )

@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """The PersonaPlex pipeline: five stages on one GPU, the LM under SGLang."""
 
-from typing import ClassVar
+from typing import Annotated, ClassVar
 
-from pydantic import Field
+from pydantic import Field, PositiveInt
 
 from sglang_omni.config.schema import (
     EngineArgs,
@@ -19,6 +19,18 @@ MODEL_STAGES_PREFIX = "sglang_omni.models.personaplex.stages"
 PREPROCESSING_STAGE = "preprocessing"
 LM_STAGE = "lm"
 CODE2WAV_STAGE = "code2wav"
+
+
+class PersonaPlexCode2WavFactoryArgs(FactoryArgs):
+    chunk_ramp_frames: list[Annotated[PositiveInt, Field(strict=True)]] = Field(
+        default_factory=lambda: [1, 4], min_length=1
+    )
+
+
+class PersonaPlexCode2WavStageConfig(StageConfig):
+    factory: PersonaPlexCode2WavFactoryArgs = Field(
+        default_factory=PersonaPlexCode2WavFactoryArgs
+    )
 
 
 def personaplex_stages_factory() -> list[StageConfig]:
@@ -52,7 +64,7 @@ def personaplex_stages_factory() -> list[StageConfig]:
             factory_path=f"{MODEL_STAGES_PREFIX}.create_decode_executor",
             terminal=True,
         ),
-        StageConfig(
+        PersonaPlexCode2WavStageConfig(
             name=CODE2WAV_STAGE,
             process="lm",
             factory_path=f"{MODEL_STAGES_PREFIX}.create_code2wav_executor",
@@ -66,7 +78,8 @@ def personaplex_stages_factory() -> list[StageConfig]:
 class PersonaPlexPipelineConfig(PipelineConfig):
     architecture: ClassVar[str] = PERSONAPLEX_ARCH
     stage_config_types: ClassVar[dict[str, type[StageConfig]]] = {
-        LM_STAGE: EngineStageConfig
+        LM_STAGE: EngineStageConfig,
+        CODE2WAV_STAGE: PersonaPlexCode2WavStageConfig,
     }
 
     model_path: str

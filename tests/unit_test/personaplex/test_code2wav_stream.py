@@ -11,8 +11,9 @@ from sglang_omni.models.personaplex.architecture import SAMPLE_RATE, SAMPLES_PER
 from sglang_omni.models.personaplex.code2wav_stream import PersonaPlexCode2WavScheduler
 from sglang_omni.models.personaplex.components.mimi import MimiCodec
 from sglang_omni.models.personaplex.payload_types import PersonaPlexState
-from sglang_omni.proto import StagePayload
-from sglang_omni.proto.request import OmniRequest
+from sglang_omni.pipeline.stage.stream_queue import StreamItem
+from sglang_omni.proto.request import OmniRequest, StagePayload
+from sglang_omni.scheduling.message import OutgoingMessage
 
 
 def decode_waveform(payload: dict) -> torch.Tensor:
@@ -22,7 +23,9 @@ def decode_waveform(payload: dict) -> torch.Tensor:
     )
 
 
-def start_stream(scheduler, request_id: str) -> StagePayload:
+def start_stream(
+    scheduler: PersonaPlexCode2WavScheduler, request_id: str
+) -> StagePayload:
     payload = StagePayload(
         request_id, request=OmniRequest(inputs={}), data=PersonaPlexState().to_dict()
     )
@@ -31,7 +34,9 @@ def start_stream(scheduler, request_id: str) -> StagePayload:
     return payload
 
 
-def test_interleaved_requests_stream_their_own_waveforms(random_codec):
+def test_interleaved_requests_stream_their_own_waveforms(
+    random_codec: MimiCodec,
+) -> None:
     codec = random_codec
     scheduler = PersonaPlexCode2WavScheduler(
         codec, compute_fn=lambda payload: payload, chunk_ramp_frames=(1,)
@@ -69,7 +74,9 @@ def test_interleaved_requests_stream_their_own_waveforms(random_codec):
         )
 
 
-def test_a_reply_with_frames_streams_whatever_arrives_first(random_codec):
+def test_a_reply_with_frames_streams_whatever_arrives_first(
+    random_codec: MimiCodec,
+) -> None:
     scheduler = PersonaPlexCode2WavScheduler(
         random_codec, compute_fn=lambda payload: payload, chunk_ramp_frames=(1,)
     )
@@ -85,7 +92,7 @@ def test_a_reply_with_frames_streams_whatever_arrives_first(random_codec):
     assert scheduler.is_streaming_payload(with_frames)
 
 
-def test_abort_clears_stream_state(random_codec):
+def test_abort_clears_stream_state(random_codec: MimiCodec) -> None:
     scheduler = PersonaPlexCode2WavScheduler(
         random_codec, compute_fn=lambda payload: payload, chunk_ramp_frames=(1,)
     )
@@ -152,7 +159,9 @@ def push_frames(
     ]
 
 
-def test_chunk_ramp_holds_frames_until_each_target_width(random_codec):
+def test_chunk_ramp_holds_frames_until_each_target_width(
+    random_codec: MimiCodec,
+) -> None:
     codec = random_codec
     scheduler = PersonaPlexCode2WavScheduler(
         codec, compute_fn=lambda payload: payload, chunk_ramp_frames=(1, 3)
@@ -168,11 +177,12 @@ def test_chunk_ramp_holds_frames_until_each_target_width(random_codec):
     streamed = []
     for frame in range(frames):
         streamed.extend(push_frames(scheduler, "a", codes[frame : frame + 1]))
-    widths = [waveform.shape[-1] // samples_per_frame for waveform in streamed]
-    assert widths == [1, 3, 3]
+    chunk_widths_in_frames = [
+        waveform.shape[-1] // samples_per_frame for waveform in streamed
+    ]
+    assert chunk_widths_in_frames == [1, 3, 3]
 
-    # note (nightdecode): the tail below the steady width flushes at stream_done
-    # instead of waiting.
+    # note (nightdecode): Stream completion releases an incomplete chunk.
     tail, result = scheduler.on_stream_done("a")
     assert decode_waveform(tail.data).shape[-1] == samples_per_frame
     assert result.type == "result"
@@ -183,7 +193,9 @@ def test_chunk_ramp_holds_frames_until_each_target_width(random_codec):
     )
 
 
-def test_chunk_ramp_decodes_burst_messages_frame_exactly(random_codec):
+def test_chunk_ramp_decodes_burst_messages_frame_exactly(
+    random_codec: MimiCodec,
+) -> None:
     codec = random_codec
     scheduler = PersonaPlexCode2WavScheduler(
         codec, compute_fn=lambda payload: payload, chunk_ramp_frames=(1, 4)
@@ -195,8 +207,7 @@ def test_chunk_ramp_decodes_burst_messages_frame_exactly(random_codec):
 
     streamed = push_frames(scheduler, "a", codes[0:1])
     assert [waveform.shape[-1] for waveform in streamed] == [samples_per_frame]
-    # note (nightdecode): a 5-frame burst covers the steady width once and
-    # holds the odd frame.
+    # note (nightdecode): One frame remains after the four-frame chunk.
     streamed += push_frames(scheduler, "a", codes[1:6])
     assert [waveform.shape[-1] for waveform in streamed] == [
         samples_per_frame,
@@ -212,7 +223,7 @@ def test_chunk_ramp_decodes_burst_messages_frame_exactly(random_codec):
     )
 
 
-def test_one_frame_ramp_decodes_as_messages_arrive(random_codec):
+def test_one_frame_ramp_decodes_as_messages_arrive(random_codec: MimiCodec) -> None:
     codec = random_codec
     scheduler = PersonaPlexCode2WavScheduler(
         codec, compute_fn=lambda payload: payload, chunk_ramp_frames=(1,)
@@ -227,7 +238,9 @@ def test_one_frame_ramp_decodes_as_messages_arrive(random_codec):
     )
 
 
-def test_chunk_ramp_single_frame_reply_decodes_immediately(random_codec):
+def test_chunk_ramp_single_frame_reply_decodes_immediately(
+    random_codec: MimiCodec,
+) -> None:
     codec = random_codec
     scheduler = PersonaPlexCode2WavScheduler(
         codec, compute_fn=lambda payload: payload, chunk_ramp_frames=(1, 4)
@@ -243,7 +256,9 @@ def test_chunk_ramp_single_frame_reply_decodes_immediately(random_codec):
     assert result.type == "result"
 
 
-def test_chunk_ramp_trims_aggregated_chunks_to_the_caller_length(random_codec):
+def test_chunk_ramp_trims_aggregated_chunks_to_the_caller_length(
+    random_codec: MimiCodec,
+) -> None:
     codec = random_codec
     scheduler = PersonaPlexCode2WavScheduler(
         codec, compute_fn=lambda payload: payload, chunk_ramp_frames=(1, 4)
@@ -278,7 +293,7 @@ def test_chunk_ramp_trims_aggregated_chunks_to_the_caller_length(random_codec):
     )
 
 
-def test_chunk_ramp_keeps_interleaved_requests_apart(random_codec):
+def test_chunk_ramp_keeps_interleaved_requests_apart(random_codec: MimiCodec) -> None:
     codec = random_codec
     scheduler = PersonaPlexCode2WavScheduler(
         codec, compute_fn=lambda payload: payload, chunk_ramp_frames=(1, 3)
@@ -310,7 +325,9 @@ def test_chunk_ramp_keeps_interleaved_requests_apart(random_codec):
         )
 
 
-def test_chunk_ramp_pending_frames_die_with_a_cancelled_request(random_codec):
+def test_chunk_ramp_pending_frames_die_with_a_cancelled_request(
+    random_codec: MimiCodec,
+) -> None:
     codec = random_codec
     scheduler = PersonaPlexCode2WavScheduler(
         codec, compute_fn=lambda payload: payload, chunk_ramp_frames=(1, 4)
@@ -318,8 +335,7 @@ def test_chunk_ramp_pending_frames_die_with_a_cancelled_request(random_codec):
     codes = torch.randint(0, 2048, (3, 8), generator=torch.Generator().manual_seed(11))
     start_stream(scheduler, "a")
     assert push_frames(scheduler, "a", codes[0:1]) != []
-    # note (nightdecode): two frames short of the steady width are held, then
-    # the request goes away.
+    # note (nightdecode): Cancellation discards frames below the decode threshold.
     assert push_frames(scheduler, "a", codes[1:3]) == []
     scheduler.clear_stream_state("a")
     assert scheduler.on_stream_done("a") == []
@@ -331,29 +347,92 @@ def test_chunk_ramp_pending_frames_die_with_a_cancelled_request(random_codec):
 
 
 @pytest.mark.parametrize(
-    ("ramp_option", "expected_frames"),
-    [
-        ([1, 4], (1, 4)),
-        ([4], (4,)),
-        ((1, 4), (1, 4)),
-    ],
+    "chunk_ramp_frames",
+    [(1,), (1, 4), (1,) + (4,) * 31 + (8, 2)],
+    ids=["single-frame", "four-frames", "largest-chunk-before-smaller-steady"],
 )
-def test_chunk_ramp_option_is_validated_at_construction(
-    random_codec, ramp_option, expected_frames
-):
-    scheduler = PersonaPlexCode2WavScheduler(
-        random_codec, compute_fn=lambda payload: payload, chunk_ramp_frames=ramp_option
+def test_chunk_ramp_matches_whole_decode_past_the_attention_ring(
+    random_codec: MimiCodec, chunk_ramp_frames: tuple[int, ...]
+) -> None:
+    frame_count = 160
+    codes = torch.randint(
+        0, 2048, (frame_count, 8), generator=torch.Generator().manual_seed(12)
     )
-    assert scheduler.chunk_ramp_frames == expected_frames
+    whole = random_codec.decode(codes.T[None])[0, 0]
+    scheduler = PersonaPlexCode2WavScheduler(
+        random_codec,
+        compute_fn=lambda payload: payload,
+        chunk_ramp_frames=chunk_ramp_frames,
+    )
+    start_stream(scheduler, "reply")
+    streamed: list[torch.Tensor] = []
+    for frame in range(frame_count):
+        streamed.extend(push_frames(scheduler, "reply", codes[frame : frame + 1]))
+    *tail, result = scheduler.on_stream_done("reply")
+    streamed.extend(decode_waveform(message.data) for message in tail)
+    torch.testing.assert_close(torch.cat(streamed), whole, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(
+        decode_waveform(result.data.data), whole, atol=1e-5, rtol=1e-5
+    )
 
 
-@pytest.mark.parametrize(
-    "ramp_option", [[], [0, 4], [1, -2], "1,4", "2,x,8", 4, None, True]
-)
-def test_invalid_chunk_ramp_option_rejects_construction(random_codec, ramp_option):
-    with pytest.raises(ValueError, match="chunk_ramp_frames"):
-        PersonaPlexCode2WavScheduler(
-            random_codec,
-            compute_fn=lambda payload: payload,
-            chunk_ramp_frames=ramp_option,
+def drain_messages(scheduler: PersonaPlexCode2WavScheduler) -> list[OutgoingMessage]:
+    messages: list[OutgoingMessage] = []
+    while not scheduler.outbox.empty():
+        messages.append(scheduler.outbox.get_nowait())
+    return messages
+
+
+@pytest.mark.parametrize("payload_first", [False, True])
+@pytest.mark.parametrize("frame_count", [9, 10, 12])
+def test_stream_done_flushes_tail_in_either_payload_order(
+    random_codec: MimiCodec, payload_first: bool, frame_count: int
+) -> None:
+    scheduler = PersonaPlexCode2WavScheduler(
+        random_codec, compute_fn=lambda payload: payload, chunk_ramp_frames=(1, 4)
+    )
+    codes = torch.randint(
+        0, 2048, (frame_count, 8), generator=torch.Generator().manual_seed(13)
+    )
+    num_samples = frame_count * SAMPLES_PER_FRAME - 17
+    payload = StagePayload(
+        "reply",
+        request=OmniRequest(inputs={}),
+        data=PersonaPlexState(codes=codes, num_samples=num_samples).to_dict(),
+    )
+    if payload_first:
+        scheduler.handle_streaming_new_request("reply", payload)
+    for frame in range(frame_count):
+        scheduler.handle_stream_chunk(
+            "reply",
+            StreamItem(
+                chunk_id=frame,
+                data=codes[frame : frame + 1],
+                from_stage="lm",
+                metadata={"num_samples": num_samples},
+            ),
         )
+    messages = drain_messages(scheduler)
+    assert len(messages) == 3
+    scheduler.handle_stream_done("reply")
+    tail = drain_messages(scheduler)
+    expected_types = ["stream"] if frame_count > 9 else []
+    assert [message.type for message in tail] == expected_types + (
+        ["result"] if payload_first else []
+    )
+    messages.extend(tail)
+    if not payload_first:
+        scheduler.handle_stream_done("reply")
+        assert drain_messages(scheduler) == []
+        scheduler.handle_streaming_new_request("reply", payload)
+        completion = drain_messages(scheduler)
+        assert [message.type for message in completion] == ["result"]
+        messages.extend(completion)
+    whole = random_codec.decode(codes.T[None])[0, 0, :num_samples]
+    streamed = torch.cat([decode_waveform(message.data) for message in messages[:-1]])
+    torch.testing.assert_close(streamed, whole, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(
+        decode_waveform(messages[-1].data.data), whole, atol=1e-5, rtol=1e-5
+    )
+    assert messages[-1].data.request is payload.request
+    assert "reply" not in scheduler.stream_states
