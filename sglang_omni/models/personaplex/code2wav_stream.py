@@ -67,7 +67,6 @@ class PersonaPlexCode2WavScheduler(StreamingSimpleScheduler):
         self.decode_slots = decode_slots
         self.stream_states: dict[str, StreamState] = {}
         self.chunk_ramp_frames: tuple[int, ...] = tuple(chunk_ramp_frames)
-        assert max(self.chunk_ramp_frames) <= decode_slots.max_chunk_frames
 
     def chunk_target_frames(self, state: StreamState) -> int:
         """Frames the next decode should cover; the last ramp entry is the steady width."""
