@@ -16,7 +16,7 @@ from typing import Protocol
 import torch
 
 from sglang_omni.models.personaplex.architecture import SAMPLE_RATE
-from sglang_omni.models.personaplex.components.mimi import MimiCodec, MimiDecodeState
+from sglang_omni.models.personaplex.mimi_decode_graph import DecodeSlot, MimiDecodeSlots
 from sglang_omni.models.personaplex.payload_types import PersonaPlexState
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.proto.request import StagePayload
@@ -46,7 +46,7 @@ class AudioPayloadDecoder(Protocol):
 
 @dataclass(kw_only=True)
 class StreamState:
-    decode_state: MimiDecodeState
+    decode_slot: DecodeSlot
     audio_parts: list[torch.Tensor] = field(default_factory=list)
     emitted_samples: int = 0
     pending_codes: deque[torch.Tensor] = field(default_factory=deque)
@@ -58,26 +58,16 @@ class StreamState:
 class PersonaPlexCode2WavScheduler(StreamingSimpleScheduler):
     def __init__(
         self,
-        codec: MimiCodec,
+        decode_slots: MimiDecodeSlots,
         *,
         compute_fn: AudioPayloadDecoder,
         chunk_ramp_frames: tuple[int, ...] | list[int],
     ) -> None:
         super().__init__(compute_fn)
-        self.codec: MimiCodec = codec
+        self.decode_slots = decode_slots
         self.stream_states: dict[str, StreamState] = {}
         self.chunk_ramp_frames: tuple[int, ...] = tuple(chunk_ramp_frames)
-
-    def get_stream_state(self, request_id: str) -> StreamState:
-        if request_id not in self.stream_states:
-            self.stream_states[request_id] = StreamState(
-                decode_state=self.codec.init_decode_state(
-                    max_chunk_frames=max(self.chunk_ramp_frames)
-                )
-            )
-        else:
-            pass
-        return self.stream_states[request_id]
+        assert max(self.chunk_ramp_frames) <= decode_slots.max_chunk_frames
 
     def chunk_target_frames(self, state: StreamState) -> int:
         """Frames the next decode should cover; the last ramp entry is the steady width."""
@@ -91,17 +81,30 @@ class PersonaPlexCode2WavScheduler(StreamingSimpleScheduler):
         codes = PersonaPlexState.from_dict(payload.data).codes
         return codes is not None and codes.shape[0] > 0
 
+    def stream_state(self, request_id: str) -> StreamState:
+        state = self.stream_states.get(request_id)
+        if state is None:
+            state = StreamState(decode_slot=self.decode_slots.acquire())
+            self.stream_states[request_id] = state
+        else:
+            pass
+        return state
+
     def on_streaming_new_request(self, request_id: str, payload: StagePayload) -> None:
-        self.get_stream_state(request_id)
+        self.stream_state(request_id)
 
     def clear_stream_state(self, request_id: str) -> None:
-        self.stream_states.pop(request_id, None)
+        state = self.stream_states.pop(request_id, None)
+        if state is not None:
+            self.decode_slots.release(state.decode_slot)
+        else:
+            pass
 
     @torch.inference_mode()
     def on_stream_chunk(
         self, request_id: str, item: StreamItem
     ) -> list[OutgoingMessage]:
-        state = self.get_stream_state(request_id)
+        state = self.stream_state(request_id)
         codes_FK = torch.as_tensor(item.data, dtype=torch.long)
         state.pending_codes.append(codes_FK)
         state.pending_frames += codes_FK.shape[0]
@@ -132,8 +135,8 @@ class PersonaPlexCode2WavScheduler(StreamingSimpleScheduler):
         )
         state.pending_frames -= frame_count
         state.decodes_done += 1
-        codes_BKF = codes_FK.T[None].to(self.codec.device)
-        waveform = self.codec.decode_step(codes_BKF, state.decode_state)[0, 0]
+        codes_BKF = codes_FK.T[None].to(self.decode_slots.codec.device)
+        waveform = self.decode_slots.decode_step(codes_BKF, state.decode_slot)[0, 0]
         waveform = waveform.float().cpu()
         if state.num_samples:
             waveform = waveform[

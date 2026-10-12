@@ -3,7 +3,7 @@
 
 from typing import Annotated, ClassVar
 
-from pydantic import Field, PositiveInt
+from pydantic import Field, NonNegativeInt, PositiveInt
 
 from sglang_omni.config.schema import (
     EngineArgs,
@@ -22,6 +22,8 @@ CODE2WAV_STAGE = "code2wav"
 
 
 class PersonaPlexCode2WavFactoryArgs(FactoryArgs):
+    num_decode_slots: NonNegativeInt = 8
+    max_graph_frames: NonNegativeInt = 1
     chunk_ramp_frames: list[Annotated[PositiveInt, Field(strict=True)]] = Field(
         default_factory=lambda: [1, 4], min_length=1
     )

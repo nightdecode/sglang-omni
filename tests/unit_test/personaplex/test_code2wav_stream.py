@@ -7,11 +7,14 @@ import numpy as np
 import pytest
 import torch
 
+from sglang_omni.models.personaplex import mimi_decode_graph
 from sglang_omni.models.personaplex.architecture import SAMPLE_RATE, SAMPLES_PER_FRAME
 from sglang_omni.models.personaplex.code2wav_stream import PersonaPlexCode2WavScheduler
 from sglang_omni.models.personaplex.components.mimi import MimiCodec
+from sglang_omni.models.personaplex.mimi_decode_graph import MimiDecodeSlots
 from sglang_omni.models.personaplex.payload_types import PersonaPlexState
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
+from sglang_omni.platforms import current_platform
 from sglang_omni.proto.request import OmniRequest, StagePayload
 from sglang_omni.scheduling.message import OutgoingMessage
 
@@ -20,6 +23,21 @@ def decode_waveform(payload: dict) -> torch.Tensor:
     assert payload["sample_rate"] == SAMPLE_RATE
     return torch.from_numpy(
         np.frombuffer(payload["audio_waveform"], dtype=np.float32).copy()
+    )
+
+
+def new_scheduler(
+    codec: MimiCodec, chunk_ramp_frames: tuple[int, ...] = (1,)
+) -> PersonaPlexCode2WavScheduler:
+    return PersonaPlexCode2WavScheduler(
+        MimiDecodeSlots(
+            codec,
+            num_slots=2,
+            max_graph_frames=1,
+            max_chunk_frames=max(chunk_ramp_frames),
+        ),
+        compute_fn=lambda payload: payload,
+        chunk_ramp_frames=chunk_ramp_frames,
     )
 
 
@@ -38,9 +56,7 @@ def test_interleaved_requests_stream_their_own_waveforms(
     random_codec: MimiCodec,
 ) -> None:
     codec = random_codec
-    scheduler = PersonaPlexCode2WavScheduler(
-        codec, compute_fn=lambda payload: payload, chunk_ramp_frames=(1,)
-    )
+    scheduler = new_scheduler(codec)
     codes = {
         "a": torch.randint(0, 2048, (4, 8), generator=torch.Generator().manual_seed(1)),
         "b": torch.randint(0, 2048, (4, 8), generator=torch.Generator().manual_seed(2)),
@@ -77,9 +93,7 @@ def test_interleaved_requests_stream_their_own_waveforms(
 def test_a_reply_with_frames_streams_whatever_arrives_first(
     random_codec: MimiCodec,
 ) -> None:
-    scheduler = PersonaPlexCode2WavScheduler(
-        random_codec, compute_fn=lambda payload: payload, chunk_ramp_frames=(1,)
-    )
+    scheduler = new_scheduler(random_codec)
     empty = StagePayload(
         "a", request=OmniRequest(inputs={}), data=PersonaPlexState().to_dict()
     )
@@ -93,9 +107,7 @@ def test_a_reply_with_frames_streams_whatever_arrives_first(
 
 
 def test_abort_clears_stream_state(random_codec: MimiCodec) -> None:
-    scheduler = PersonaPlexCode2WavScheduler(
-        random_codec, compute_fn=lambda payload: payload, chunk_ramp_frames=(1,)
-    )
+    scheduler = new_scheduler(random_codec)
     start_stream(scheduler, "a")
     assert scheduler.on_stream_done("a") != []
     scheduler.clear_stream_state("a")
@@ -112,9 +124,7 @@ def test_reply_length_matches_the_caller_in_chunks_and_final_payload(
     random_codec: MimiCodec, num_samples: int
 ) -> None:
     codec = random_codec
-    scheduler = PersonaPlexCode2WavScheduler(
-        codec, compute_fn=lambda payload: payload, chunk_ramp_frames=(1,)
-    )
+    scheduler = new_scheduler(codec)
     frames, samples_per_frame = 4, codec.samples_per_frame
     expected_samples = num_samples or frames * samples_per_frame
     codes = torch.randint(
@@ -163,9 +173,7 @@ def test_chunk_ramp_holds_frames_until_each_target_width(
     random_codec: MimiCodec,
 ) -> None:
     codec = random_codec
-    scheduler = PersonaPlexCode2WavScheduler(
-        codec, compute_fn=lambda payload: payload, chunk_ramp_frames=(1, 3)
-    )
+    scheduler = new_scheduler(codec, (1, 3))
     frames = 8
     codes = torch.randint(
         0, 2048, (frames, 8), generator=torch.Generator().manual_seed(4)
@@ -197,9 +205,7 @@ def test_chunk_ramp_decodes_burst_messages_frame_exactly(
     random_codec: MimiCodec,
 ) -> None:
     codec = random_codec
-    scheduler = PersonaPlexCode2WavScheduler(
-        codec, compute_fn=lambda payload: payload, chunk_ramp_frames=(1, 4)
-    )
+    scheduler = new_scheduler(codec, (1, 4))
     codes = torch.randint(0, 2048, (6, 8), generator=torch.Generator().manual_seed(5))
     whole = codec.decode(codes.T[None])[0, 0]
     samples_per_frame = codec.samples_per_frame
@@ -225,9 +231,7 @@ def test_chunk_ramp_decodes_burst_messages_frame_exactly(
 
 def test_one_frame_ramp_decodes_as_messages_arrive(random_codec: MimiCodec) -> None:
     codec = random_codec
-    scheduler = PersonaPlexCode2WavScheduler(
-        codec, compute_fn=lambda payload: payload, chunk_ramp_frames=(1,)
-    )
+    scheduler = new_scheduler(codec, (1,))
     codes = torch.randint(0, 2048, (3, 8), generator=torch.Generator().manual_seed(6))
     start_stream(scheduler, "a")
 
@@ -242,9 +246,7 @@ def test_chunk_ramp_single_frame_reply_decodes_immediately(
     random_codec: MimiCodec,
 ) -> None:
     codec = random_codec
-    scheduler = PersonaPlexCode2WavScheduler(
-        codec, compute_fn=lambda payload: payload, chunk_ramp_frames=(1, 4)
-    )
+    scheduler = new_scheduler(codec, (1, 4))
     codes = torch.randint(0, 2048, (1, 8), generator=torch.Generator().manual_seed(7))
     start_stream(scheduler, "a")
 
@@ -260,9 +262,7 @@ def test_chunk_ramp_trims_aggregated_chunks_to_the_caller_length(
     random_codec: MimiCodec,
 ) -> None:
     codec = random_codec
-    scheduler = PersonaPlexCode2WavScheduler(
-        codec, compute_fn=lambda payload: payload, chunk_ramp_frames=(1, 4)
-    )
+    scheduler = new_scheduler(codec, (1, 4))
     frames = 6
     samples_per_frame = codec.samples_per_frame
     num_samples = 3 * samples_per_frame + 100
@@ -295,9 +295,7 @@ def test_chunk_ramp_trims_aggregated_chunks_to_the_caller_length(
 
 def test_chunk_ramp_keeps_interleaved_requests_apart(random_codec: MimiCodec) -> None:
     codec = random_codec
-    scheduler = PersonaPlexCode2WavScheduler(
-        codec, compute_fn=lambda payload: payload, chunk_ramp_frames=(1, 3)
-    )
+    scheduler = new_scheduler(codec, (1, 3))
     codes = {
         "a": torch.randint(0, 2048, (6, 8), generator=torch.Generator().manual_seed(9)),
         "b": torch.randint(
@@ -329,9 +327,7 @@ def test_chunk_ramp_pending_frames_die_with_a_cancelled_request(
     random_codec: MimiCodec,
 ) -> None:
     codec = random_codec
-    scheduler = PersonaPlexCode2WavScheduler(
-        codec, compute_fn=lambda payload: payload, chunk_ramp_frames=(1, 4)
-    )
+    scheduler = new_scheduler(codec, (1, 4))
     codes = torch.randint(0, 2048, (3, 8), generator=torch.Generator().manual_seed(11))
     start_stream(scheduler, "a")
     assert push_frames(scheduler, "a", codes[0:1]) != []
@@ -359,11 +355,7 @@ def test_chunk_ramp_matches_whole_decode_past_the_attention_ring(
         0, 2048, (frame_count, 8), generator=torch.Generator().manual_seed(12)
     )
     whole = random_codec.decode(codes.T[None])[0, 0]
-    scheduler = PersonaPlexCode2WavScheduler(
-        random_codec,
-        compute_fn=lambda payload: payload,
-        chunk_ramp_frames=chunk_ramp_frames,
-    )
+    scheduler = new_scheduler(random_codec, chunk_ramp_frames)
     start_stream(scheduler, "reply")
     streamed: list[torch.Tensor] = []
     for frame in range(frame_count):
@@ -388,9 +380,7 @@ def drain_messages(scheduler: PersonaPlexCode2WavScheduler) -> list[OutgoingMess
 def test_stream_done_flushes_tail_in_either_payload_order(
     random_codec: MimiCodec, payload_first: bool, frame_count: int
 ) -> None:
-    scheduler = PersonaPlexCode2WavScheduler(
-        random_codec, compute_fn=lambda payload: payload, chunk_ramp_frames=(1, 4)
-    )
+    scheduler = new_scheduler(random_codec, (1, 4))
     codes = torch.randint(
         0, 2048, (frame_count, 8), generator=torch.Generator().manual_seed(13)
     )
@@ -436,3 +426,59 @@ def test_stream_done_flushes_tail_in_either_payload_order(
     )
     assert messages[-1].data.request is payload.request
     assert "reply" not in scheduler.stream_states
+
+
+def test_platforms_without_codec_decode_graphs_keep_no_slots(random_codec, monkeypatch):
+    monkeypatch.setattr(
+        mimi_decode_graph,
+        "current_platform",
+        SimpleNamespace(
+            enable_codec_decode_graph=lambda: False,
+            get_device_graph_backend=lambda device: SimpleNamespace(),
+        ),
+    )
+    slots = MimiDecodeSlots(
+        random_codec, num_slots=8, max_graph_frames=1, max_chunk_frames=1
+    )
+    assert slots.graphs == {} and slots.decode_states == []
+    assert slots.acquire().index is None
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(
+    not current_platform.enable_codec_decode_graph(),
+    reason="the platform does not capture codec decode graphs",
+)
+def test_graph_replay_matches_eager_decode_across_slot_reuse(random_codec):
+    codec = random_codec.cuda()
+    slots = MimiDecodeSlots(codec, num_slots=2, max_graph_frames=2, max_chunk_frames=3)
+    assert len(slots.graphs) == 4
+    codes = torch.randint(
+        0, 2048, (2, 8, 140), generator=torch.Generator().manual_seed(6)
+    ).cuda()
+    # Note (wilsonzheng0327): Width 3 has no graph and runs eager on the same slot;
+    # 140 frames are 280 steps, past the transformer's 250-step ring.
+    widths = [1, 2, 1, 3] * 20
+    expected = []
+    for stream in range(2):
+        state = codec.init_decode_state(batch_size=1, max_chunk_frames=3)
+        parts, start = [], 0
+        for width in widths:
+            chunk = codes[stream : stream + 1, :, start : start + width]
+            parts.append(codec.decode_step(chunk, state))
+            start += width
+        expected.append(torch.cat(parts, -1))
+
+    for _ in range(2):
+        pair = [slots.acquire(), slots.acquire()]
+        assert {slot.index for slot in pair} == {0, 1}
+        replayed = [[], []]
+        start = 0
+        for width in widths:
+            for stream, slot in enumerate(pair):
+                chunk = codes[stream : stream + 1, :, start : start + width]
+                replayed[stream].append(slots.decode_step(chunk, slot).clone())
+            start += width
+        for stream, slot in enumerate(pair):
+            assert torch.equal(torch.cat(replayed[stream], -1), expected[stream])
+            slots.release(slot)
