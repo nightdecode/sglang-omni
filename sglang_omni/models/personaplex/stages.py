@@ -18,8 +18,12 @@ from sglang_omni.models.personaplex.components.mimi import (
     load_mimi_codec,
     resolve_mimi_weights,
 )
-from sglang_omni.models.personaplex.config import PREPROCESSING_STAGE
+from sglang_omni.models.personaplex.config import (
+    DEFAULT_LM_MAX_RUNNING_REQUESTS,
+    PREPROCESSING_STAGE,
+)
 from sglang_omni.models.personaplex.engine_builder import PersonaPlexEngineBuilder
+from sglang_omni.models.personaplex.mimi_decode_graph import MimiDecodeSlots
 from sglang_omni.models.personaplex.payload_types import PersonaPlexState
 from sglang_omni.models.personaplex.prompts import (
     DEFAULT_TEXT_PROMPT,
@@ -186,7 +190,8 @@ def create_lm_executor(
     # overrides, so an engine context_length must reach the builder too.
     context_length = server_args_overrides.get("context_length", context_length)
     builder = PersonaPlexEngineBuilder(
-        max_running_requests=1, context_length=context_length
+        max_running_requests=DEFAULT_LM_MAX_RUNNING_REQUESTS,
+        context_length=context_length,
     )
     return builder.build(
         model_path,
@@ -214,12 +219,16 @@ def create_decode_executor(
 def create_code2wav_executor(
     model_path: str,
     *,
+    num_decode_slots: int,
+    max_batch_size: int,
+    max_graph_frames: int,
     device: str | None = None,
     gpu_id: int | None = None,
-    max_batch_size: int,
-    stream_slots: int,
     **_,
 ) -> PersonaPlexCode2WavScheduler:
+    """Whole-reply decode, plus streaming decode on num_decode_slots resident
+    states, up to max_batch_size streams per step, with device graphs for
+    chunks of up to max_graph_frames frames."""
     codec, device = load_codec(model_path, device=device, gpu_id=gpu_id)
 
     @torch.inference_mode()
@@ -241,12 +250,13 @@ def create_code2wav_executor(
         )
         return payload
 
-    return PersonaPlexCode2WavScheduler(
+    decode_slots = MimiDecodeSlots(
         codec,
-        compute_fn=decode,
+        num_slots=num_decode_slots,
         max_batch_size=max_batch_size,
-        stream_slots=stream_slots,
+        max_graph_frames=max_graph_frames,
     )
+    return PersonaPlexCode2WavScheduler(decode_slots, compute_fn=decode)
 
 
 __all__ = [

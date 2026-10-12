@@ -9,7 +9,7 @@ import pytest
 import torch
 
 from sglang_omni.models.personaplex import stages
-from sglang_omni.models.personaplex.architecture import MIMI, SAMPLES_PER_FRAME
+from sglang_omni.models.personaplex.architecture import SAMPLES_PER_FRAME
 from sglang_omni.models.personaplex.payload_types import PersonaPlexState
 from sglang_omni.models.personaplex.prompts import (
     DEFAULT_TEXT_PROMPT,
@@ -167,17 +167,7 @@ def test_whole_reply_decode_is_cut_back_to_the_caller_length(monkeypatch):
     num_samples = 3 * samples_per_frame + 7
 
     class _Codec:
-        # The decode arena preallocates its slot buffers from the codec spec
-        # and module shapes even though the whole-reply path only calls
-        # decode(); mirror those attributes so construction can proceed.
-        device = "cpu"
-        spec = MIMI
-
-        def __init__(self):
-            self.upsample = SimpleNamespace(
-                convtr=SimpleNamespace(weight=torch.zeros(1)), padding_total=2
-            )
-            self.decoder = SimpleNamespace(model=[])
+        device = torch.device("cpu")
 
         def decode(self, codes_BKF):
             return torch.arange(float(codes_BKF.shape[-1] * samples_per_frame)).view(
@@ -185,11 +175,21 @@ def test_whole_reply_decode_is_cut_back_to_the_caller_length(monkeypatch):
             )
 
     monkeypatch.setattr(stages, "load_codec", lambda *a, **k: (_Codec(), "cpu"))
+    built_slots = {}
+
+    def build_slots(codec, **slot_kwargs):
+        # The streaming slots never run here: the whole reply decodes at once.
+        built_slots.update(slot_kwargs)
+        return SimpleNamespace(
+            codec=codec, max_batch_size=slot_kwargs["max_batch_size"]
+        )
+
+    monkeypatch.setattr(stages, "MimiDecodeSlots", build_slots)
     scheduler = stages.create_code2wav_executor(
-        "m",
-        max_batch_size=1,
-        stream_slots=1,
+        "m", num_decode_slots=4, max_batch_size=2, max_graph_frames=1
     )
+    assert built_slots == {"num_slots": 4, "max_batch_size": 2, "max_graph_frames": 1}
+    assert scheduler.max_batch_size == 2
     state = PersonaPlexState(
         num_samples=num_samples, codes=torch.zeros(frames, 8, dtype=torch.long)
     )

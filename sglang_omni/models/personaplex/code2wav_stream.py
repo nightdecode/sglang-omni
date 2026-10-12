@@ -1,5 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Stream generated Mimi codes through a capacity-bounded decode arena."""
+"""Streams the agent's Mimi codes into audio as they are generated.
+
+Mimi's decoder is causal and its chunked path lands on exactly the samples a
+whole-sequence decode would, so each frame goes out as soon as its codes
+arrive: 1920 samples per 80 ms frame, no holdback. Chunks that are ready
+across requests decode together in one step on the shared decode slots; a
+stream that finds every slot taken buffers its chunks until one frees.
+"""
 
 from __future__ import annotations
 
@@ -9,12 +16,8 @@ from typing import Protocol
 
 import torch
 
-from sglang_omni.admission import QueueFullError
 from sglang_omni.models.personaplex.architecture import SAMPLE_RATE
-from sglang_omni.models.personaplex.components.mimi import (
-    MimiCodec,
-    MimiDecodeStateArena,
-)
+from sglang_omni.models.personaplex.mimi_decode_graph import MimiDecodeSlots
 from sglang_omni.models.personaplex.payload_types import PersonaPlexState
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.profiler.event_recorder import emit as emit_event
@@ -45,12 +48,14 @@ class AudioPayloadDecoder(Protocol):
 
 
 @dataclass(kw_only=True)
-class Code2WavStreamState:
+class StreamState:
+    # None while waiting for a slot, and again once the stream is done.
+    slot_index: int | None
     pending_chunks: deque[torch.Tensor] = field(default_factory=deque)
     audio_parts: list[torch.Tensor] = field(default_factory=list)
+    decoded_frames: int = 0
     emitted_samples: int = 0
     num_samples: int = 0
-    slot_index: int | None = None
     stream_done: bool = False
     # Position in the ready queue: stamped when the request gains its first
     # pending chunk and again after each decode step that leaves it with
@@ -61,29 +66,17 @@ class Code2WavStreamState:
 
 class PersonaPlexCode2WavScheduler(StreamingSimpleScheduler):
     def __init__(
-        self,
-        codec: MimiCodec,
-        *,
-        compute_fn: AudioPayloadDecoder,
-        max_batch_size: int,
-        stream_slots: int,
+        self, decode_slots: MimiDecodeSlots, *, compute_fn: AudioPayloadDecoder
     ) -> None:
-        super().__init__(compute_fn, max_batch_size=max_batch_size)
-        self.codec = codec
-        self.stream_states: dict[str, Code2WavStreamState] = {}
+        super().__init__(compute_fn, max_batch_size=decode_slots.max_batch_size)
+        self.decode_slots = decode_slots
+        self.stream_states: dict[str, StreamState] = {}
         self.next_ready_order = 0
-        stream_slot_count = max(int(stream_slots), 1)
-        self.decode_arena = MimiDecodeStateArena(codec, stream_slot_count)
-        self.free_slot_indices = list(reversed(range(stream_slot_count)))
         if self.max_batch_size > 1:
             self.can_batch_stream_chunks = True
             self.stream_chunk_batch_max = self.max_batch_size
         else:
             pass
-
-    @property
-    def active_slot_count(self) -> int:
-        return self.decode_arena.slot_count - len(self.free_slot_indices)
 
     def is_streaming_payload(self, payload: StagePayload) -> bool:
         # Note (wilsonzheng0327): The LM streams every frame it produces, so a reply
@@ -92,51 +85,63 @@ class PersonaPlexCode2WavScheduler(StreamingSimpleScheduler):
         codes = PersonaPlexState.from_dict(payload.data).codes
         return codes is not None and codes.shape[0] > 0
 
-    def on_streaming_new_request(self, request_id: str, payload: StagePayload) -> None:
-        self.get_or_create_stream_state(request_id)
-
-    def get_or_create_stream_state(self, request_id: str) -> Code2WavStreamState:
+    def stream_state(self, request_id: str) -> StreamState:
         state = self.stream_states.get(request_id)
-        if state is not None:
-            return state
+        if state is None:
+            # Note (nightdecode): The LM admits its next request as soon as one
+            # finishes, while that stream's last chunks may still be decoding
+            # here, so for a moment there can be more streams than LM slots.
+            # Such a stream buffers its chunks and takes the next free slot.
+            state = StreamState(slot_index=self.decode_slots.acquire())
+            self.stream_states[request_id] = state
         else:
             pass
-        state = Code2WavStreamState()
-        self.assign_decode_slot(state)
-        self.stream_states[request_id] = state
         return state
 
-    def assign_decode_slot(self, state: Code2WavStreamState) -> None:
-        if state.slot_index is not None:
-            pass
-        elif state.stream_done and not state.pending_chunks:
-            pass
-        elif not self.free_slot_indices:
-            raise QueueFullError()
-        else:
-            slot_index = self.free_slot_indices.pop()
-            self.decode_arena.reset_slot(slot_index)
-            state.slot_index = slot_index
+    @staticmethod
+    def needs_decode_slot(state: StreamState) -> bool:
+        return state.slot_index is None and bool(state.pending_chunks)
 
-    def release_decode_slot(self, state: Code2WavStreamState) -> None:
-        slot_index = state.slot_index
-        assert slot_index is not None
-        state.slot_index = None
-        self.free_slot_indices.append(slot_index)
+    def bind_waiting_streams(self) -> None:
+        """Hand free slots to streams in the order their first chunk became ready."""
+        waiting = sorted(
+            (
+                state
+                for state in self.stream_states.values()
+                if self.needs_decode_slot(state)
+            ),
+            key=lambda state: state.ready_order,
+        )
+        for state in waiting:
+            state.slot_index = self.decode_slots.acquire()
+            if state.slot_index is None:
+                return
+            else:
+                pass
+
+    def on_streaming_new_request(self, request_id: str, payload: StagePayload) -> None:
+        self.stream_state(request_id)
+
+    def release_decode_slot(self, state: StreamState) -> None:
+        if state.slot_index is not None:
+            self.decode_slots.release(state.slot_index)
+            state.slot_index = None
+            self.bind_waiting_streams()
+        else:
+            pass
 
     def clear_stream_state(self, request_id: str) -> None:
         state = self.stream_states.pop(request_id, None)
-        if state is not None and state.slot_index is not None:
+        if state is not None:
             self.release_decode_slot(state)
         else:
             pass
 
-    def ingest_chunk(
-        self, request_id: str, stream_item: StreamItem
-    ) -> Code2WavStreamState:
-        state = self.get_or_create_stream_state(request_id)
-        metadata = stream_item.metadata or {}
-        num_samples = int(metadata.get("num_samples") or 0)
+    def ingest_chunk(self, request_id: str, stream_item: StreamItem) -> StreamState:
+        state = self.stream_state(request_id)
+        # Note (wilsonzheng0327): The terminal payload only arrives after the LM finishes,
+        # so the caller length travels with each chunk.
+        num_samples = int((stream_item.metadata or {}).get("num_samples") or 0)
         if num_samples:
             if state.num_samples not in (0, num_samples):
                 raise ValueError(
@@ -154,22 +159,26 @@ class PersonaPlexCode2WavScheduler(StreamingSimpleScheduler):
             pass
         state.pending_chunks.append(
             torch.as_tensor(
-                stream_item.data, dtype=torch.long, device=self.codec.device
+                stream_item.data,
+                dtype=torch.long,
+                device=self.decode_slots.codec.device,
             )
         )
+        self.bind_waiting_streams()
         return state
 
-    def stamp_ready_order(self, state: Code2WavStreamState) -> None:
+    def stamp_ready_order(self, state: StreamState) -> None:
         state.ready_order = self.next_ready_order
         self.next_ready_order += 1
 
-    @torch.inference_mode()
     def on_stream_chunk(
         self, request_id: str, stream_item: StreamItem
     ) -> list[OutgoingMessage]:
         state = self.ingest_chunk(request_id, stream_item)
-        assert state.slot_index is not None
-        return self.decode_slot_batch([(request_id, state)])
+        if state.slot_index is None:
+            return []
+        else:
+            return self.decode_slot_batch([(request_id, state)])
 
     def on_stream_chunk_batch(self, items: list[tuple[str, StreamItem]]) -> None:
         """Ingest chunks, then decode at least as many chunks as were
@@ -194,9 +203,9 @@ class PersonaPlexCode2WavScheduler(StreamingSimpleScheduler):
             self.cleanup_aborted_request(request_id)
         # Note (nightdecode): One step per message batch is not enough: a batch
         # may carry several chunks of one request, and a step serves only one
-        # compatible group. Decoding at least the ingested count keeps the
-        # total backlog from growing while the inbox stays non-empty; the
-        # extra steps are bounded by the batch size.
+        # chunk width. Decoding at least the ingested count keeps the total
+        # backlog from growing while the inbox stays non-empty; the extra steps
+        # are bounded by the batch size.
         decoded_chunks = 0
         while True:
             step_chunks = self.run_decode_step()
@@ -210,28 +219,28 @@ class PersonaPlexCode2WavScheduler(StreamingSimpleScheduler):
         with self.state_lock:
             return bool(self.select_step_participants())
 
-    def select_step_participants(
-        self,
-    ) -> list[tuple[str, Code2WavStreamState]]:
-        compatible_groups: dict[
-            tuple[int, bool], list[tuple[str, Code2WavStreamState]]
-        ] = {}
+    def select_step_participants(self) -> list[tuple[str, StreamState]]:
+        """The longest-waiting ready request and up to max_batch_size - 1 others
+        whose next chunk has its width, longest-waiting first.
+
+        Rows at any decode offset share a step; only the width must match.
+        """
+        width_groups: dict[int, list[tuple[str, StreamState]]] = {}
         for request_id, state in self.stream_states.items():
             if state.slot_index is not None and state.pending_chunks:
-                batch_key = self.chunk_batch_key(state)
-                compatible_groups.setdefault(batch_key, []).append((request_id, state))
+                width_groups.setdefault(state.pending_chunks[0].shape[0], []).append(
+                    (request_id, state)
+                )
             else:
                 pass
-        compatible_state_groups = list(compatible_groups.values())
-        for compatible_states in compatible_state_groups:
-            compatible_states.sort(key=lambda entry: entry[1].ready_order)
-        if not compatible_state_groups:
+        if not width_groups:
             return []
         else:
             pass
+        for group in width_groups.values():
+            group.sort(key=lambda entry: entry[1].ready_order)
         selected_group = min(
-            compatible_state_groups,
-            key=lambda group: group[0][1].ready_order,
+            width_groups.values(), key=lambda group: group[0][1].ready_order
         )
         return selected_group[: self.max_batch_size]
 
@@ -262,10 +271,7 @@ class PersonaPlexCode2WavScheduler(StreamingSimpleScheduler):
                         pass
                 for request_id, state in participants:
                     if state.stream_done and not state.pending_chunks:
-                        if state.slot_index is not None:
-                            self.release_decode_slot(state)
-                        else:
-                            pass
+                        self.release_decode_slot(state)
                         if request_id in self.stream_payloads:
                             self.complete_stream_request(
                                 request_id,
@@ -279,37 +285,23 @@ class PersonaPlexCode2WavScheduler(StreamingSimpleScheduler):
             self.cleanup_aborted_request(request_id)
         return len(participants)
 
-    def chunk_batch_key(self, state: Code2WavStreamState) -> tuple[int, bool]:
-        slot_index = state.slot_index
-        assert slot_index is not None and state.pending_chunks
-        return (
-            state.pending_chunks[0].shape[0],
-            self.decode_arena.decoded_frame_count(slot_index) == 0,
-        )
-
     @torch.inference_mode()
     def decode_slot_batch(
-        self, participants: list[tuple[str, Code2WavStreamState]]
+        self, participants: list[tuple[str, StreamState]]
     ) -> list[OutgoingMessage]:
-        assert participants
-        batch_key = self.chunk_batch_key(participants[0][1])
-        assert all(
-            self.chunk_batch_key(state) == batch_key for _, state in participants
-        )
+        """Decode each participant's next chunk in one step on its own slot."""
+        chunk_frames = participants[0][1].pending_chunks[0].shape[0]
         slot_indices = [state.slot_index for _, state in participants]
         assert all(slot_index is not None for slot_index in slot_indices)
-        concrete_slot_indices = [int(slot_index) for slot_index in slot_indices]
-        decoded_frame_counts = [
-            self.decode_arena.decoded_frame_count(slot_index)
-            for slot_index in concrete_slot_indices
-        ]
-        pending_chunks = [state.pending_chunks[0] for _, state in participants]
-        batched_codes = torch.stack([frame_codes.T for frame_codes in pending_chunks])
-        waveform_batch = self.decode_arena.decode_step(
-            batched_codes, slot_indices=concrete_slot_indices
+        decoded_frames = [state.decoded_frames for _, state in participants]
+        batched_codes = torch.stack(
+            [state.pending_chunks[0].T for _, state in participants]
         )
+        waveform_batch = self.decode_slots.decode_step(batched_codes, slot_indices)
+        host_waveforms = waveform_batch[:, 0].float().cpu()
         for _, state in participants:
             state.pending_chunks.popleft()
+            state.decoded_frames += chunk_frames
             if state.pending_chunks:
                 self.stamp_ready_order(state)
             else:
@@ -321,29 +313,31 @@ class PersonaPlexCode2WavScheduler(StreamingSimpleScheduler):
                 event_name="code2wav_chunk_batch",
                 metadata={
                     "batch_size": len(participants),
-                    "chunk_frames": batch_key[0],
-                    "decoded_frames": decoded_frame_counts,
-                    "slot_indices": concrete_slot_indices,
+                    "chunk_frames": chunk_frames,
+                    "graph_replayed": (len(participants), chunk_frames)
+                    in self.decode_slots.graphs,
+                    "decoded_frames": decoded_frames,
+                    "slot_indices": slot_indices,
                     "participant_request_ids": [
                         request_id for request_id, _ in participants
                     ],
-                    "active_slots": self.active_slot_count,
+                    "active_slots": self.decode_slots.active_slot_count,
+                    "waiting_streams": sum(
+                        self.needs_decode_slot(state)
+                        for state in self.stream_states.values()
+                    ),
                     "inbox_depth": self.inbox.qsize(),
                 },
             )
         else:
             pass
-        host_waveforms = waveform_batch[:, 0].float().cpu()
         return [
             self.build_stream_message(request_id, state, host_waveforms[row_index])
             for row_index, (request_id, state) in enumerate(participants)
         ]
 
     def build_stream_message(
-        self,
-        request_id: str,
-        state: Code2WavStreamState,
-        waveform: torch.Tensor,
+        self, request_id: str, state: StreamState, waveform: torch.Tensor
     ) -> OutgoingMessage:
         if state.num_samples:
             waveform = waveform[
@@ -368,18 +362,16 @@ class PersonaPlexCode2WavScheduler(StreamingSimpleScheduler):
             metadata={"modality": "audio"},
         )
 
-    def finish_stream_decode(
-        self, request_id: str, state: Code2WavStreamState
-    ) -> list[OutgoingMessage]:
+    def finish_stream_decode(self, state: StreamState) -> None:
+        """Mark the stream done; its slot frees once its last chunk decodes."""
         state.stream_done = True
-        if not state.pending_chunks and state.slot_index is not None:
+        if not state.pending_chunks:
             self.release_decode_slot(state)
         else:
             pass
-        return []
 
     def build_result_message(
-        self, request_id: str, state: Code2WavStreamState
+        self, request_id: str, state: StreamState
     ) -> OutgoingMessage:
         waveform = torch.cat(state.audio_parts) if state.audio_parts else torch.zeros(0)
         return OutgoingMessage(
@@ -399,11 +391,11 @@ class PersonaPlexCode2WavScheduler(StreamingSimpleScheduler):
 
     def on_stream_done_before_payload(self, request_id: str) -> list[OutgoingMessage]:
         state = self.stream_states.get(request_id)
-        if state is None:
-            return []
+        if state is not None:
+            self.finish_stream_decode(state)
         else:
             pass
-        return self.finish_stream_decode(request_id, state)
+        return []
 
     def on_stream_done(self, request_id: str) -> list[OutgoingMessage] | None:
         state = self.stream_states.get(request_id)
@@ -411,13 +403,12 @@ class PersonaPlexCode2WavScheduler(StreamingSimpleScheduler):
             return []
         else:
             pass
-        stream_messages = self.finish_stream_decode(request_id, state)
+        self.finish_stream_decode(state)
         if state.pending_chunks:
             return None
         else:
             pass
-        stream_messages.append(self.build_result_message(request_id, state))
-        return stream_messages
+        return [self.build_result_message(request_id, state)]
 
 
 __all__ = ["PersonaPlexCode2WavScheduler", "trim_to_caller"]

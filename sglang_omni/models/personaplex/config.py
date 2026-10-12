@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """The PersonaPlex pipeline: five stages on one GPU, the LM under SGLang."""
 
+from collections.abc import Mapping
 from typing import ClassVar
 
 from pydantic import Field
@@ -19,11 +20,21 @@ MODEL_STAGES_PREFIX = "sglang_omni.models.personaplex.stages"
 PREPROCESSING_STAGE = "preprocessing"
 LM_STAGE = "lm"
 CODE2WAV_STAGE = "code2wav"
+# The LM's concurrency when lm.engine.max_running_requests is unset.
+DEFAULT_LM_MAX_RUNNING_REQUESTS = 1
 
 
 class PersonaPlexCode2WavFactoryArgs(FactoryArgs):
+    """Streaming decode: num_decode_slots streams resident at once, up to
+    max_batch_size of them per step, device graphs for chunks of up to
+    max_graph_frames frames (0 turns the graphs off).
+
+    num_decode_slots is derived from the LM's concurrency unless set.
+    """
+
+    num_decode_slots: int | None = Field(default=None, ge=1)
     max_batch_size: int = Field(default=8, ge=1)
-    stream_slots: int = Field(default=16, ge=1)
+    max_graph_frames: int = Field(default=1, ge=0)
 
 
 class PersonaPlexCode2WavStageConfig(StageConfig):
@@ -92,34 +103,48 @@ class PersonaPlexPipelineConfig(PipelineConfig):
 
     def model_post_init(self, __context: object = None) -> None:
         super().model_post_init(__context)
-        self.validate_code2wav_capacity()
-
-    def validate_code2wav_capacity(self) -> None:
-        """Every LM request streams into its own code2wav decode slot, so fewer
-        slots than LM running requests turns admitted requests into 503s."""
-        stages = {stage.name: stage for stage in self.stages}
-        lm_stage = stages.get(LM_STAGE)
-        code2wav_stage = stages.get(CODE2WAV_STAGE)
-        if lm_stage is None or code2wav_stage is None:
-            return
-        else:
-            pass
-        engine = getattr(lm_stage, "engine", None)
-        max_running = engine.max_running_requests if engine is not None else None
-        stream_slots = getattr(code2wav_stage.factory, "stream_slots", None)
-        if max_running is None or stream_slots is None:
-            return
-        else:
-            pass
-        if stream_slots < max_running:
+        # Note (nightdecode): An unset num_decode_slots stays unset and is
+        # derived at launch in stage_factory_kwargs; writing the derivation
+        # back would make it look pinned on the next merge. Only a pinned
+        # value is checked, on every rebuild.
+        num_decode_slots = self.pinned_num_decode_slots()
+        lm_max_running = self.lm_max_running_requests()
+        if num_decode_slots is not None and num_decode_slots < lm_max_running:
             raise ValueError(
-                f"{CODE2WAV_STAGE}.factory.stream_slots={stream_slots} is below "
-                f"{LM_STAGE}.engine.max_running_requests={max_running}: every "
-                "running LM request needs its own code2wav decode slot. Raise "
-                "stream_slots to at least max_running_requests."
+                f"{CODE2WAV_STAGE}.factory.num_decode_slots={num_decode_slots} is "
+                f"below the LM's max_running_requests={lm_max_running}: every "
+                "running LM request needs a code2wav decode slot of its own. "
+                "Omit num_decode_slots to derive it from the LM."
             )
         else:
             pass
+
+    def stage_factory_kwargs(self, stage_name: str) -> Mapping[str, object]:
+        if stage_name == CODE2WAV_STAGE:
+            # Note (nightdecode): Match LM concurrency. Streams whose lifetimes
+            # overlap while tail audio drains wait for a decode slot.
+            return {"num_decode_slots": self.lm_max_running_requests()}
+        else:
+            return super().stage_factory_kwargs(stage_name)
+
+    def pinned_num_decode_slots(self) -> int | None:
+        stage = self.stage_or_none(CODE2WAV_STAGE)
+        value = (
+            getattr(stage.factory, "num_decode_slots", None)
+            if stage is not None
+            else None
+        )
+        return int(value) if value is not None else None
+
+    def lm_max_running_requests(self) -> int:
+        """The LM's concurrency: its engine setting, else the stage default."""
+        stage = self.stage_or_none(LM_STAGE)
+        engine = getattr(stage, "engine", None)
+        value = engine.max_running_requests if engine is not None else None
+        return int(value) if value is not None else DEFAULT_LM_MAX_RUNNING_REQUESTS
+
+    def stage_or_none(self, stage_name: str) -> StageConfig | None:
+        return next((stage for stage in self.stages if stage.name == stage_name), None)
 
 
 EntryClass = PersonaPlexPipelineConfig

@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import torch
 from einops import rearrange
@@ -18,34 +18,25 @@ from sglang_omni.models.personaplex.components.causal_conv import StreamingModul
 def apply_interleaved_rope(
     q: torch.Tensor, k: torch.Tensor, positions: torch.Tensor, max_period: float
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Rotate adjacent pairs using shared [T] or per-row [B, T] positions."""
-    dimension = q.shape[-1]
-    frequencies = torch.exp(
-        torch.arange(dimension // 2, device=q.device, dtype=torch.float32)
-        * (-math.log(max_period) * 2 / dimension)
+    """Rotate adjacent pairs (2i, 2i+1), the GPT-J convention, in float32.
+
+    Args:
+        q, k: [B, H, T, D].
+        positions: [B, T] absolute positions, or [1, T] shared by every row.
+    """
+    dim = q.shape[-1]
+    freqs = torch.exp(
+        torch.arange(dim // 2, device=q.device, dtype=torch.float32)
+        * (-math.log(max_period) * 2 / dim)
     )
-    angles = positions.to(torch.float32)[..., None] * frequencies
-    if positions.ndim == 1:
-        angles = angles[None, None]
-    elif positions.ndim == 2:
-        angles = angles[:, None]
-    else:
-        raise ValueError(
-            f"RoPE positions must have shape [T] or [B, T], got {positions.shape}"
-        )
-    cosine, sine = torch.cos(angles), torch.sin(angles)
+    angles = (positions.to(torch.float32)[..., None] * freqs)[:, None]
+    cos, sin = torch.cos(angles), torch.sin(angles)
 
     def rotate(x: torch.Tensor) -> torch.Tensor:
-        pairs = x.float().view(*x.shape[:-1], dimension // 2, 2)
-        real, imaginary = pairs[..., 0], pairs[..., 1]
-        output = torch.stack(
-            [
-                real * cosine - imaginary * sine,
-                real * sine + imaginary * cosine,
-            ],
-            dim=-1,
-        )
-        return output.view(x.shape).to(x.dtype)
+        pairs = x.float().view(*x.shape[:-1], dim // 2, 2)
+        real, imag = pairs[..., 0], pairs[..., 1]
+        out = torch.stack([real * cos - imag * sin, real * sin + imag * cos], dim=-1)
+        return out.view(x.shape).to(x.dtype)
 
     return rotate(q), rotate(k)
 
@@ -54,9 +45,12 @@ def apply_interleaved_rope(
 class AttentionState:
     """The reference's ring cache: a fixed buffer written modulo its capacity."""
 
-    keys: torch.Tensor | None = None
-    values: torch.Tensor | None = None
-    end_offset: int | torch.Tensor = 0
+    keys: torch.Tensor
+    values: torch.Tensor
+
+    def reset(self) -> None:
+        self.keys.zero_()
+        self.values.zero_()
 
 
 class MimiAttention(nn.Module):
@@ -79,6 +73,14 @@ class MimiAttention(nn.Module):
         self.in_proj_weight = nn.Parameter(torch.empty(3 * dim, dim))
         self.out_proj = nn.Linear(dim, dim, bias=False)
 
+    def init_state(self, batch_size: int) -> AttentionState:
+        dim = self.in_proj_weight.shape[1]
+        ring_shape = (batch_size, self.num_heads, self.context, dim // self.num_heads)
+        return AttentionState(
+            keys=self.in_proj_weight.new_zeros(ring_shape),
+            values=self.in_proj_weight.new_zeros(ring_shape),
+        )
+
     def forward(
         self,
         x: torch.Tensor,
@@ -86,21 +88,26 @@ class MimiAttention(nn.Module):
         offset: int | torch.Tensor = 0,
         state: AttentionState | None = None,
     ) -> torch.Tensor:
+        """With a state, offset is how many steps its ring has already taken.
+
+        An int or 0-dim offset holds for every row; a [B] offset gives each row
+        its own, so streams at different points decode in one batch.
+        """
         length = x.shape[1]
         projected = functional.linear(x, self.in_proj_weight)
         q, k, v = rearrange(
             projected, "b t (p h d) -> p b h t d", p=3, h=self.num_heads
         )
-        relative_positions = torch.arange(length, device=x.device)
+        steps = torch.arange(length, device=x.device)
+        # [B, T] with one offset per row, else [1, T] shared by every row.
         if isinstance(offset, torch.Tensor):
-            assert offset.shape == (x.shape[0],)
-            query_positions = offset[:, None] + relative_positions[None]
+            pos_q = offset.view(-1, 1) + steps
         else:
-            query_positions = offset + relative_positions
-        q, k = apply_interleaved_rope(q, k, query_positions, self.max_period)
+            pos_q = (offset + steps).view(1, -1)
+        q, k = apply_interleaved_rope(q, k, pos_q, self.max_period)
         if state is None:
-            key_positions = query_positions
-            position_delta = query_positions[..., :, None] - key_positions[..., None, :]
+            pos_k = pos_q
+            delta = pos_q[:, :, None] - pos_k[:, None, :]
             # Note (wilsonzheng0327): The reference writes a whole chunk into its ring
             # before attending, and once the ring is full it labels the slot at the
             # write cursor as a future position. So a query sees only the keys
@@ -109,77 +116,51 @@ class MimiAttention(nn.Module):
             # A partial last chunk only advances the cursor by what it holds.
             # As a rule over positions this is one batched attention that matches
             # the frame-by-frame ring bit for bit.
-            cursor = (query_positions // self.write_chunk + 1) * self.write_chunk
-            cursor = torch.minimum(cursor, query_positions[..., :1] + length)
-            mask = (position_delta >= 0) & (
-                key_positions[..., None, :] > (cursor - self.context)[..., :, None]
+            cursor = torch.minimum(
+                (pos_q // self.write_chunk + 1) * self.write_chunk,
+                pos_q[:, :1] + length,
+            )
+            mask = (delta >= 0) & (
+                pos_k[:, None, :] > (cursor - self.context)[:, :, None]
             )
         else:
-            key_positions = self.write_ring(k, v, state)
+            pos_k = self.write_ring(k, v, pos_q, state)
             k, v = state.keys, state.values
-            position_delta = query_positions[..., :, None] - key_positions[..., None, :]
-            mask = (
-                (key_positions[..., None, :] >= 0)
-                & (position_delta >= 0)
-                & (position_delta < self.context)
-            )
-        if mask.ndim == 3:
-            mask = mask[:, None]
-        else:
-            pass
-        output = functional.scaled_dot_product_attention(q, k, v, attn_mask=mask)
-        return self.out_proj(rearrange(output, "b h t d -> b t (h d)"))
+            delta = pos_q[:, :, None] - pos_k[:, None, :]
+            mask = (pos_k[:, None, :] >= 0) & (delta >= 0) & (delta < self.context)
+        out = functional.scaled_dot_product_attention(q, k, v, attn_mask=mask[:, None])
+        return self.out_proj(rearrange(out, "b h t d -> b t (h d)"))
 
     def write_ring(
-        self, k: torch.Tensor, v: torch.Tensor, state: AttentionState
+        self,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        new_positions: torch.Tensor,
+        state: AttentionState,
     ) -> torch.Tensor:
         """Store this step in the ring and label every slot as the reference does.
 
+        new_positions are the new keys' absolute steps, [B, T] or [1, T] like
+        the queries'; the labels come back as [B, capacity] or [1, capacity].
         The slot about to be overwritten is labelled as a future position, so
         once the ring is full its oldest entry falls outside the window; the
         non-streaming mask in forward applies the same rule without the ring.
         """
         capacity = self.context
-        if state.keys is None:
-            shape = (k.shape[0], k.shape[1], capacity, k.shape[3])
-            state.keys, state.values = k.new_zeros(shape), v.new_zeros(shape)
-        else:
-            pass
+        slots = (new_positions % capacity)[:, None, :, None].expand_as(k)
+        state.keys.scatter_(2, slots, k)
+        state.values.scatter_(2, slots, v)
+        end_offset = new_positions[:, -1:] + 1
+
         indexes = torch.arange(capacity, device=k.device)
-        step_positions = torch.arange(k.shape[2], device=k.device)
-        if isinstance(state.end_offset, torch.Tensor):
-            assert state.end_offset.shape == (k.shape[0],)
-            slots = state.end_offset[:, None] + step_positions[None]
-            scatter_indexes = slots.remainder(capacity)[:, None, :, None].expand_as(k)
-            state.keys.scatter_(2, scatter_indexes, k)
-            state.values.scatter_(2, scatter_indexes, v)
-            state.end_offset = state.end_offset + k.shape[2]
-            end_offsets = state.end_offset[:, None]
-            position_delta = indexes[None] - end_offsets.remainder(capacity)
-            positions = torch.where(
-                position_delta <= 0,
-                end_offsets + position_delta,
-                end_offsets + position_delta - capacity,
-            )
-            return torch.where(
-                indexes[None] >= end_offsets,
-                torch.full_like(positions, -1),
-                positions,
-            )
-        else:
-            pass
-        slots = step_positions + state.end_offset
-        state.keys.index_copy_(2, slots.remainder(capacity), k)
-        state.values.index_copy_(2, slots.remainder(capacity), v)
-        state.end_offset += k.shape[2]
-        position_delta = indexes - state.end_offset % capacity
+        delta = indexes - end_offset % capacity
         positions = torch.where(
-            position_delta <= 0,
-            state.end_offset + position_delta,
-            state.end_offset + position_delta - capacity,
+            delta <= 0,
+            end_offset + delta,
+            end_offset + delta - capacity,
         )
         return torch.where(
-            indexes >= state.end_offset, torch.full_like(positions, -1), positions
+            indexes >= end_offset, torch.full_like(positions, -1), positions
         )
 
 
@@ -226,8 +207,16 @@ class MimiTransformerLayer(nn.Module):
 
 @dataclass
 class TransformerState:
-    offset: int | torch.Tensor = 0
-    layers: list[AttentionState] = field(default_factory=list)
+    """Steps each row has taken so far, as a [B] tensor a device graph reads, and
+    each ring."""
+
+    offset: torch.Tensor
+    layers: list[AttentionState]
+
+    def reset(self) -> None:
+        self.offset.zero_()
+        for layer in self.layers:
+            layer.reset()
 
 
 class MimiTransformer(StreamingModule):
@@ -246,12 +235,16 @@ class MimiTransformer(StreamingModule):
             x = layer(x)
         return x.transpose(1, 2)
 
-    def init_state(self) -> TransformerState:
-        return TransformerState(layers=[AttentionState() for _ in self.layers])
+    def init_state(self, batch_size: int) -> TransformerState:
+        device = self.layers[0].self_attn.in_proj_weight.device
+        return TransformerState(
+            offset=torch.zeros((batch_size,), dtype=torch.long, device=device),
+            layers=[layer.self_attn.init_state(batch_size) for layer in self.layers],
+        )
 
     def step(self, x: torch.Tensor, state: TransformerState) -> torch.Tensor:
         x = x.transpose(1, 2)
         for layer, layer_state in zip(self.layers, state.layers, strict=True):
             x = layer(x, offset=state.offset, state=layer_state)
-        state.offset += x.shape[1]
+        state.offset.add_(x.shape[1])
         return x.transpose(1, 2)
