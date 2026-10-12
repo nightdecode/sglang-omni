@@ -23,7 +23,7 @@ CODE2WAV_STAGE = "code2wav"
 
 class PersonaPlexCode2WavFactoryArgs(FactoryArgs):
     num_decode_slots: NonNegativeInt = 8
-    max_graph_frames: NonNegativeInt = 1
+    max_graph_frames: NonNegativeInt | None = None
     chunk_ramp_frames: list[Annotated[PositiveInt, Field(strict=True)]] = Field(
         default_factory=lambda: [1, 4], min_length=1
     )
@@ -91,6 +91,16 @@ class PersonaPlexPipelineConfig(PipelineConfig):
         )
     )
     stages: list[StageConfig] = Field(default_factory=personaplex_stages_factory)
+
+    def stage_factory_kwargs(self, stage_name: str) -> dict[str, int]:
+        if stage_name == CODE2WAV_STAGE:
+            return {
+                "max_graph_frames": max(
+                    self.stage_named(CODE2WAV_STAGE).factory.chunk_ramp_frames
+                )
+            }
+        else:
+            return {}
 
 
 EntryClass = PersonaPlexPipelineConfig

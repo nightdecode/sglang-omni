@@ -46,6 +46,7 @@ def test_personaplex_chunk_ramp_default_is_in_the_stage_configuration() -> None:
         1,
         4,
     ]
+    assert config.stage_named("code2wav").factory.max_graph_frames is None
 
 
 @pytest.mark.parametrize(
