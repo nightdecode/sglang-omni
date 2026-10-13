@@ -240,6 +240,9 @@ def test_code2wav_graph_limit_follows_resolved_configuration(
         resolved = ConfigResolver(config).resolve(patches).config
     codec = Mock()
     decode_slots = Mock()
+    decode_slots.return_value.max_chunk_frames = max(
+        max(chunk_ramp_frames), expected_graph_frames
+    )
     monkeypatch.setattr(stages, "load_codec", lambda *a, **k: (codec, "cpu"))
     monkeypatch.setattr(stages, "MimiDecodeSlots", decode_slots)
     factory_args = resolve_stage_factory_args(
