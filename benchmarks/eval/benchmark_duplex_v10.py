@@ -14,9 +14,12 @@ from pathlib import Path
 from openai import OpenAI
 
 from benchmarks.duplex import v10_dataset
-from benchmarks.duplex.artifacts import add_server_identity_args, server_identity
-from benchmarks.duplex.profiles import DEFAULT_PROFILE, PROFILES
-from benchmarks.duplex.reference_core import V10_REFERENCE_FILES
+from benchmarks.duplex.artifacts import (
+    add_protocol_args,
+    add_server_identity_args,
+    server_identity,
+)
+from benchmarks.duplex.reference_core import V10_REFERENCE_FILES, read_json
 from benchmarks.duplex.reference_source import verify_reference
 from benchmarks.duplex.reference_v10 import (
     JudgeLedger,
@@ -26,6 +29,7 @@ from benchmarks.duplex.reference_v10 import (
     transcribe,
 )
 from benchmarks.duplex.run_artifacts import TIMELINES, accounting, load_run
+from benchmarks.duplex.unified_v10 import render, score_tree
 from benchmarks.duplex.v10_evaluation import RUN_KIND, score_run
 from benchmarks.duplex.v15_runner import run_samples
 from benchmarks.duplex.v15_transcribe import add_transcribe_arguments
@@ -54,6 +58,9 @@ def record(args: argparse.Namespace) -> int:
             variants=VARIANTS,
             kind=RUN_KIND,
             profile=args.profile,
+            concurrency=args.concurrency,
+            turn_detection=args.turn_detection,
+            legacy_tail_s=args.legacy_tail,
         )
     )
     manifest, _, _ = load_run(args.output)
@@ -121,10 +128,11 @@ def reference_evaluate(args: argparse.Namespace) -> int:
         else:
             pass
         timestamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        client = OpenAI(api_key=api_key, base_url=args.base_url)
         judge = JudgeLedger(
-            OpenAI(api_key=api_key, base_url=args.base_url),
+            client,
             args.tree / "judge" / f"user-interruption-{timestamp}.jsonl",
-            args.base_url,
+            str(client.base_url),
             args.served_model,
         )
     else:
@@ -139,6 +147,31 @@ def reference_evaluate(args: argparse.Namespace) -> int:
     return 0
 
 
+def unified_score(args: argparse.Namespace) -> int:
+    unified = score_tree(args.tree)
+    summary_path = args.tree / "summary.json"
+    summary = read_json(summary_path) if summary_path.exists() else None
+    changed = (
+        []
+        if summary is None
+        else [
+            name
+            for name in ("manifest_sha256", "asr_sha256")
+            if summary[name] != unified[name]
+        ]
+    )
+    official = summary["subsets"] if summary is not None and not changed else {}
+    print(render(unified, official))
+    if changed:
+        print(
+            f"summary.json has a different {' and '.join(changed)} than this tree; "
+            "official reference numbers omitted"
+        )
+    else:
+        pass
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -150,12 +183,19 @@ def main(argv: list[str] | None = None) -> int:
         "--output", type=Path, required=True, help="New immutable run directory"
     )
     add_server_identity_args(record_parser)
-    record_parser.add_argument("--profile", choices=PROFILES, default=DEFAULT_PROFILE)
+    add_protocol_args(record_parser)
     record_parser.add_argument(
         "--dataset-revision", required=True, help="Dataset release or archive digest"
     )
     record_parser.add_argument(
         "--timeout", type=float, default=120.0, help="Per-session deadline in seconds"
+    )
+    record_parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=1,
+        help="Maximum concurrent variants; excess connections may receive "
+        "HTTP 503 and fail if admission retries are exhausted",
     )
     selection = record_parser.add_mutually_exclusive_group()
     selection.add_argument(
@@ -241,6 +281,15 @@ def main(argv: list[str] | None = None) -> int:
         "--served-model", help="Model name sent to --base-url in place of gpt-4-turbo"
     )
     evaluate_parser.set_defaults(handler=reference_evaluate)
+
+    unified_parser = commands.add_parser(
+        "unified-score",
+        help="System-agnostic metrics from the reference transcripts and annotations",
+    )
+    unified_parser.add_argument(
+        "--tree", type=Path, required=True, help="Tree transcribed by reference-asr"
+    )
+    unified_parser.set_defaults(handler=unified_score)
 
     args = parser.parse_args(argv)
     if args.command == "reference-evaluate" and (args.base_url is None) != (

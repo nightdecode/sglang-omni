@@ -3,7 +3,6 @@
 
 import asyncio
 from dataclasses import replace
-from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -48,6 +47,7 @@ def new_scheduler(
     num_slots: int,
     max_batch_size: int,
     max_graph_frames: int = 1,
+    chunk_ramp_frames: tuple[int, ...] = (1,),
 ) -> PersonaPlexCode2WavScheduler:
     return PersonaPlexCode2WavScheduler(
         MimiDecodeSlots(
@@ -55,8 +55,10 @@ def new_scheduler(
             num_slots=num_slots,
             max_batch_size=max_batch_size,
             max_graph_frames=max_graph_frames,
+            max_chunk_frames=max(chunk_ramp_frames),
         ),
         compute_fn=lambda payload: payload,
+        chunk_ramp_frames=chunk_ramp_frames,
     )
 
 
@@ -69,10 +71,17 @@ def start_stream(scheduler, request_id: str) -> None:
 
 
 def feed_serial(scheduler, request_id: str, chunk: torch.Tensor) -> torch.Tensor:
-    (message,) = scheduler.on_stream_chunk(
-        request_id, SimpleNamespace(data=chunk, metadata=None)
+    messages = deliver_chunk(
+        scheduler, request_id, StreamItem(chunk_id=0, from_stage="lm", data=chunk)
     )
-    return decode_waveform(message.data)
+    return torch.cat([decode_waveform(message.data) for message in messages])
+
+
+def deliver_chunk(
+    scheduler, request_id: str, item: StreamItem
+) -> list[OutgoingMessage]:
+    scheduler.handle_stream_chunk(request_id, item)
+    return drain_outbox(scheduler)
 
 
 def feed_native(
@@ -86,7 +95,10 @@ def feed_batched(
 ) -> dict[str, torch.Tensor]:
     scheduler.on_stream_chunk_batch(
         [
-            (request_id, SimpleNamespace(data=chunk, metadata=None))
+            (
+                request_id,
+                StreamItem(chunk_id=0, from_stage="lm", data=chunk, metadata=None),
+            )
             for request_id, chunk in chunks
         ]
     )
@@ -96,7 +108,12 @@ def feed_batched(
     while not scheduler.outbox.empty():
         message = scheduler.outbox.get_nowait()
         assert message.type == "stream"
-        waveforms[message.request_id] = decode_waveform(message.data)
+        waveform = decode_waveform(message.data)
+        waveforms[message.request_id] = (
+            torch.cat([waveforms[message.request_id], waveform])
+            if message.request_id in waveforms
+            else waveform
+        )
     return waveforms
 
 
@@ -148,7 +165,8 @@ def test_batched_lockstep_matches_serial(random_codec: MimiCodec) -> None:
         for request_id, seed in (("a", 1), ("b", 2), ("c", 3))
     }
     native_states = {
-        request_id: codec.init_decode_state(batch_size=1) for request_id in codes
+        request_id: codec.init_decode_state(batch_size=1, max_chunk_frames=2)
+        for request_id in codes
     }
     batched = new_scheduler(codec, num_slots=4, max_batch_size=4)
     for request_id in codes:
@@ -246,6 +264,13 @@ def test_released_slot_is_reused_without_moving_survivors(
     scheduler = new_scheduler(random_codec, num_slots=2, max_batch_size=2)
     for request_id in ("a", "b"):
         start_stream(scheduler, request_id)
+    feed_batched(
+        scheduler,
+        [
+            (request_id, random_codes(1, seed))
+            for seed, request_id in enumerate(("a", "b"))
+        ],
+    )
     slot_a = scheduler.stream_states["a"].slot_index
     slot_b = scheduler.stream_states["b"].slot_index
     assert slot_a is not None and slot_b is not None
@@ -253,6 +278,7 @@ def test_released_slot_is_reused_without_moving_survivors(
     scheduler.clear_stream_state("a")
     assert scheduler.stream_states["b"].slot_index == slot_b
     start_stream(scheduler, "c")
+    feed_batched(scheduler, [("c", random_codes(1, 3))])
     assert scheduler.stream_states["c"].slot_index == slot_a
 
 
@@ -284,7 +310,8 @@ def test_different_offsets_batch_after_attention_ring_wraparound() -> None:
     codec = small_context_codec()
     batched = new_scheduler(codec, num_slots=2, max_batch_size=2)
     native_states = {
-        request_id: codec.init_decode_state(batch_size=1) for request_id in ("a", "b")
+        request_id: codec.init_decode_state(batch_size=1, max_chunk_frames=2)
+        for request_id in ("a", "b")
     }
     codes_a = random_codes(6, 25)
     codes_b = random_codes(2, 26)
@@ -332,8 +359,9 @@ def test_waiting_streams_take_freed_slots_in_ready_order(
     # c becomes ready before b, although its terminal payload arrived later.
     for request_id in ("a", "c", "b"):
         for chunk in codes[request_id].split(1):
-            scheduler.ingest_chunk(
-                request_id, SimpleNamespace(data=chunk, metadata=None)
+            scheduler.ingest_stream_item(
+                request_id,
+                StreamItem(chunk_id=0, from_stage="lm", data=chunk, metadata=None),
             )
         scheduler.handle_stream_done(request_id)
     assert scheduler.stream_states["c"].slot_index is None
@@ -363,8 +391,10 @@ def test_waiting_streams_take_freed_slots_in_ready_order(
     assert scheduler.decode_slots.active_slot_count == 0
     assert scheduler.stream_states["empty"].slot_index is None
     # A previously empty waiter must become runnable when its first chunk arrives.
-    assert scheduler.on_stream_chunk(
-        "empty", SimpleNamespace(data=codes["a"][:1], metadata=None)
+    assert deliver_chunk(
+        scheduler,
+        "empty",
+        StreamItem(chunk_id=0, from_stage="lm", data=codes["a"][:1], metadata=None),
     )
     scheduler.handle_stream_done("empty")
     assert scheduler.stream_states == {}
@@ -379,10 +409,13 @@ def test_waiters_survive_slot_owner_exit_and_waiting_cancellation(
     for request_id in ("owner", "cancelled", "survivor"):
         start_stream(scheduler, request_id)
     chunk = random_codes(1, 104)
+    feed_serial(scheduler, "owner", chunk)
     for request_id in ("cancelled", "survivor"):
         assert (
-            scheduler.on_stream_chunk(
-                request_id, SimpleNamespace(data=chunk, metadata=None)
+            deliver_chunk(
+                scheduler,
+                request_id,
+                StreamItem(chunk_id=0, from_stage="lm", data=chunk, metadata=None),
             )
             == []
         )
@@ -405,7 +438,12 @@ def test_waiters_survive_slot_owner_exit_and_waiting_cancellation(
 
         monkeypatch.setattr(scheduler.decode_slots, "decode_step", fail_once)
         scheduler.on_stream_chunk_batch(
-            [("owner", SimpleNamespace(data=chunk, metadata=None))]
+            [
+                (
+                    "owner",
+                    StreamItem(chunk_id=0, from_stage="lm", data=chunk, metadata=None),
+                )
+            ]
         )
     while scheduler.has_ready_work():
         scheduler.run_ready_step()
@@ -436,8 +474,14 @@ def test_waiting_stream_finishes_before_its_terminal_payload(
     scheduler = new_scheduler(random_codec, num_slots=1, max_batch_size=2)
     start_stream(scheduler, "owner")
     chunk = random_codes(1, 105)
+    feed_serial(scheduler, "owner", chunk)
     scheduler.on_stream_chunk_batch(
-        [("waiting", SimpleNamespace(data=chunk, metadata=None))]
+        [
+            (
+                "waiting",
+                StreamItem(chunk_id=0, from_stage="lm", data=chunk, metadata=None),
+            )
+        ]
     )
     scheduler.handle_stream_done("waiting")
     scheduler.handle_stream_done("owner")
@@ -470,39 +514,43 @@ def test_waiting_stream_finishes_before_its_terminal_payload(
 def test_different_offsets_share_steps_but_different_widths_do_not(
     random_codec: MimiCodec,
 ) -> None:
-    codec = random_codec
-    codes = {
-        request_id: random_codes(8, seed) for request_id, seed in (("a", 11), ("b", 12))
-    }
-    batched = new_scheduler(codec, num_slots=4, max_batch_size=4)
-    serial = new_scheduler(codec, num_slots=8, max_batch_size=1)
+    scheduler = new_scheduler(
+        random_codec, num_slots=2, max_batch_size=2, chunk_ramp_frames=(1, 2)
+    )
+    codes = {"a": random_codes(6, 11), "b": random_codes(5, 12)}
     for request_id in codes:
-        start_stream(batched, request_id)
-    batch_sizes = record_decode_steps(batched)
+        start_stream(scheduler, request_id)
+    shapes = []
+    original = scheduler.decode_slots.decode_step
 
-    rounds = [
-        [("a", codes["a"][0:2])],
-        # b's first chunk shares a step with a, two frames in: a fresh slot is
-        # zeros, the very state a first step starts from.
-        [("a", codes["a"][2:4]), ("b", codes["b"][0:2])],
-        # One frame against two: two steps.
-        [("a", codes["a"][4:5]), ("b", codes["b"][2:4])],
-        [("a", codes["a"][5:6]), ("b", codes["b"][4:5])],
-        [("a", codes["a"][6:7]), ("b", codes["b"][5:6])],
-        [("a", codes["a"][7:8]), ("b", codes["b"][6:7])],
-        [("b", codes["b"][7:8])],
+    def record(codes, slots):
+        shapes.append((codes.shape[0], codes.shape[-1]))
+        return original(codes, slots)
+
+    scheduler.decode_slots.decode_step = record
+    for chunks in [
+        [("a", codes["a"][:1])],
+        [("a", codes["a"][1:3]), ("b", codes["b"][:1])],
+        [("a", codes["a"][3:5]), ("b", codes["b"][1:3])],
+        [("a", codes["a"][5:6]), ("b", codes["b"][3:5])],
+    ]:
+        feed_batched(scheduler, chunks)
+    for request_id in codes:
+        scheduler.handle_stream_done(request_id)
+    while scheduler.has_ready_work():
+        scheduler.run_ready_step()
+    results = [
+        message for message in drain_outbox(scheduler) if message.type == "result"
     ]
-    expected_batch_sizes = [1, 2, 1, 1, 2, 2, 2, 1]
-    for round_chunks in rounds:
-        streamed = feed_batched(batched, round_chunks)
-        for request_id, chunk in round_chunks:
-            torch.testing.assert_close(
-                streamed[request_id],
-                feed_serial(serial, request_id, chunk),
-                rtol=1e-5,
-                atol=1e-5,
-            )
-    assert batch_sizes == expected_batch_sizes
+    assert shapes == [(1, 1), (1, 2), (1, 1), (2, 2), (1, 2), (1, 1)]
+    assert len(results) == 2
+    for message in results:
+        torch.testing.assert_close(
+            decode_waveform(message.data.data),
+            random_codec.decode(codes[message.request_id].T[None])[0, 0],
+            atol=1e-5,
+            rtol=1e-5,
+        )
 
 
 def test_per_request_caller_length_trimmed_in_batch(random_codec: MimiCodec) -> None:
@@ -524,7 +572,9 @@ def test_per_request_caller_length_trimmed_in_batch(random_codec: MimiCodec) -> 
             [
                 (
                     request_id,
-                    SimpleNamespace(
+                    StreamItem(
+                        chunk_id=0,
+                        from_stage="lm",
                         data=codes[request_id][frame : frame + 1],
                         metadata={"num_samples": lengths[request_id]},
                     ),
@@ -543,71 +593,52 @@ def test_per_request_caller_length_trimmed_in_batch(random_codec: MimiCodec) -> 
 def test_a_failing_step_aborts_exactly_its_participants(
     random_codec: MimiCodec,
 ) -> None:
-    codec = random_codec
-    codes = {
-        request_id: random_codes(4, seed)
-        for request_id, seed in (("a", 31), ("b", 32), ("c", 33))
-    }
-    batched = new_scheduler(codec, num_slots=4, max_batch_size=4)
-    serial = new_scheduler(codec, num_slots=8, max_batch_size=1)
-    for request_id in codes:
-        start_stream(batched, request_id)
-    original_decode_step = batched.decode_slots.decode_step
+    scheduler = new_scheduler(
+        random_codec, num_slots=3, max_batch_size=3, chunk_ramp_frames=(1, 2)
+    )
+    codes = random_codes(5, 33)
+    for request_id in ("a", "b", "c"):
+        start_stream(scheduler, request_id)
+    feed_batched(scheduler, [("c", codes[:1])])
+    original = scheduler.decode_slots.decode_step
 
-    def fail_batch_of_two(codes_BKF, slot_indices):
-        if codes_BKF.shape[0] == 2:
+    def fail_batch_of_two(codes, slots):
+        if codes.shape[0] == 2:
             raise RuntimeError("boom")
-        else:
-            pass
-        return original_decode_step(codes_BKF, slot_indices)
+        return original(codes, slots)
 
-    batched.decode_slots.decode_step = fail_batch_of_two
-    # a and b send one-frame chunks and share the failing step; c sends two
-    # frames, so it decodes in a step of its own.
-    batched.on_stream_chunk_batch(
+    scheduler.decode_slots.decode_step = fail_batch_of_two
+    scheduler.on_stream_chunk_batch(
         [
-            ("a", SimpleNamespace(data=codes["a"][0:1], metadata=None)),
-            ("b", SimpleNamespace(data=codes["b"][0:1], metadata=None)),
-            ("c", SimpleNamespace(data=codes["c"][0:2], metadata=None)),
+            (request_id, StreamItem(chunk_id=0, from_stage="lm", data=chunk))
+            for request_id, chunk in [
+                ("a", codes[:1]),
+                ("b", codes[:1]),
+                ("c", codes[1:3]),
+            ]
         ]
     )
-    while batched.has_ready_work():
-        batched.run_ready_step()
-    batched.decode_slots.decode_step = original_decode_step
-    feed_serial(serial, "c", codes["c"][0:2])
-
-    messages = drain_outbox(batched)
-    errors = {m.request_id for m in messages if m.type == "error"}
-    streams = {m.request_id for m in messages if m.type == "stream"}
-    assert errors == {"a", "b"}
-    assert streams == {"c"}
-    assert "a" not in batched.stream_states
-    assert "b" not in batched.stream_states
-    assert batched.decode_slots.active_slot_count == 1
-
-    # The survivor keeps decoding exactly; freed slots serve fresh requests.
-    start_stream(batched, "d")
-    codes_d = random_codes(4, 34)
-    for frame in range(2, 4):
-        streamed = feed_batched(
-            batched,
-            [
-                ("c", codes["c"][frame : frame + 1]),
-                ("d", codes_d[frame - 2 : frame - 1]),
-            ],
-        )
-        torch.testing.assert_close(
-            streamed["c"],
-            feed_serial(serial, "c", codes["c"][frame : frame + 1]),
-            rtol=1e-5,
-            atol=1e-5,
-        )
-        torch.testing.assert_close(
-            streamed["d"],
-            feed_serial(serial, "d", codes_d[frame - 2 : frame - 1]),
-            rtol=1e-5,
-            atol=1e-5,
-        )
+    while scheduler.has_ready_work():
+        scheduler.run_ready_step()
+    messages = drain_outbox(scheduler)
+    assert {message.request_id for message in messages if message.type == "error"} == {
+        "a",
+        "b",
+    }
+    assert {message.request_id for message in messages if message.type == "stream"} == {
+        "c"
+    }
+    assert set(scheduler.stream_states) == {"c"}
+    scheduler.decode_slots.decode_step = original
+    feed_batched(scheduler, [("c", codes[3:5]), ("d", codes[:1])])
+    scheduler.handle_stream_done("c")
+    (result,) = drain_outbox(scheduler)
+    torch.testing.assert_close(
+        decode_waveform(result.data.data),
+        random_codec.decode(codes.T[None])[0, 0],
+        atol=1e-5,
+        rtol=1e-5,
+    )
 
 
 def test_a_failing_batch_aborts_every_participant(random_codec: MimiCodec) -> None:
@@ -626,7 +657,15 @@ def test_a_failing_batch_aborts_every_participant(random_codec: MimiCodec) -> No
     batched.decode_slots.decode_step = always_fail
     batched.on_stream_chunk_batch(
         [
-            (request_id, SimpleNamespace(data=codes[request_id][0:1], metadata=None))
+            (
+                request_id,
+                StreamItem(
+                    chunk_id=0,
+                    from_stage="lm",
+                    data=codes[request_id][0:1],
+                    metadata=None,
+                ),
+            )
             for request_id in codes
         ]
     )
@@ -656,8 +695,14 @@ def test_multiple_chunks_for_one_request_are_drained_in_order(
 
     scheduler.on_stream_chunk_batch(
         [
-            ("a", SimpleNamespace(data=codes[0:1], metadata=None)),
-            ("a", SimpleNamespace(data=codes[1:2], metadata=None)),
+            (
+                "a",
+                StreamItem(chunk_id=0, from_stage="lm", data=codes[0:1], metadata=None),
+            ),
+            (
+                "a",
+                StreamItem(chunk_id=0, from_stage="lm", data=codes[1:2], metadata=None),
+            ),
         ]
     )
     while scheduler.has_ready_work():
@@ -686,10 +731,13 @@ def test_backlogged_requests_rotate_between_decode_steps(
     with scheduler.state_lock:
         for request_id in request_ids:
             for frame in (1, 2):
-                scheduler.ingest_chunk(
+                scheduler.ingest_stream_item(
                     request_id,
-                    SimpleNamespace(
-                        data=codes[request_id][frame : frame + 1], metadata=None
+                    StreamItem(
+                        chunk_id=0,
+                        from_stage="lm",
+                        data=codes[request_id][frame : frame + 1],
+                        metadata=None,
                     ),
                 )
     for expected_request_ids in ({"a", "b"}, {"c", "d"}, {"a", "b"}, {"c", "d"}):
@@ -697,6 +745,47 @@ def test_backlogged_requests_rotate_between_decode_steps(
         assert {
             message.request_id for message in drain_outbox(scheduler)
         } == expected_request_ids
+
+
+def test_ramp_collects_queued_frames_before_selecting_a_decode_batch(
+    random_codec: MimiCodec,
+) -> None:
+    scheduler = new_scheduler(
+        random_codec, num_slots=8, max_batch_size=8, chunk_ramp_frames=(1, 4)
+    )
+    codes = {str(index): random_codes(5, index + 100) for index in range(8)}
+    for request_id in codes:
+        start_stream(scheduler, request_id)
+    feed_batched(
+        scheduler, [(request_id, frames[:1]) for request_id, frames in codes.items()]
+    )
+    shapes = []
+    original = scheduler.decode_slots.decode_step
+
+    def decode_step(codes_BKF, slot_indices):
+        shapes.append((codes_BKF.shape[0], codes_BKF.shape[-1]))
+        return original(codes_BKF, slot_indices)
+
+    scheduler.decode_slots.decode_step = decode_step
+    for request_id, frames in codes.items():
+        for frame in range(1, 5):
+            scheduler.inbox.put(
+                IncomingMessage(
+                    request_id=request_id,
+                    type="stream_chunk",
+                    data=StreamItem(
+                        chunk_id=frame, from_stage="lm", data=frames[frame : frame + 1]
+                    ),
+                )
+            )
+    loop = asyncio.new_event_loop()
+    try:
+        scheduler.handle_message(scheduler.get_batch_message(), loop)
+    finally:
+        loop.close()
+    assert shapes == [(8, 4)]
+    assert scheduler.inbox.empty()
+    assert {message.request_id for message in drain_outbox(scheduler)} == set(codes)
 
 
 def test_start_loop_decodes_before_a_continuously_refilled_inbox_drains(
@@ -756,18 +845,29 @@ def test_start_loop_decodes_before_a_continuously_refilled_inbox_drains(
 
 
 def test_ready_buckets_rotate_without_waiting(random_codec: MimiCodec) -> None:
-    scheduler = new_scheduler(random_codec, num_slots=3, max_batch_size=2)
+    scheduler = new_scheduler(
+        random_codec, num_slots=3, max_batch_size=2, chunk_ramp_frames=(1, 2)
+    )
     for request_id in ("a", "b", "c"):
         start_stream(scheduler, request_id)
 
+    feed_batched(scheduler, [("a", random_codes(1, 44))])
     with scheduler.state_lock:
-        scheduler.ingest_chunk(
-            "a", SimpleNamespace(data=random_codes(2, 45), metadata=None)
+        scheduler.ingest_stream_item(
+            "a",
+            StreamItem(
+                chunk_id=0, from_stage="lm", data=random_codes(2, 45), metadata=None
+            ),
         )
         for request_id, seed in (("b", 46), ("c", 47)):
-            scheduler.ingest_chunk(
+            scheduler.ingest_stream_item(
                 request_id,
-                SimpleNamespace(data=random_codes(1, seed), metadata=None),
+                StreamItem(
+                    chunk_id=0,
+                    from_stage="lm",
+                    data=random_codes(1, seed),
+                    metadata=None,
+                ),
             )
     assert scheduler.has_ready_work()
     scheduler.run_ready_step()
@@ -803,13 +903,16 @@ def test_config_enables_batching_by_default(random_codec: MimiCodec) -> None:
     factory = config.stage_named(CODE2WAV_STAGE).factory
     assert factory.num_decode_slots is None
     assert factory.max_batch_size == 8
-    assert factory.max_graph_frames == 1
+    assert factory.max_graph_frames is None
+    assert factory.chunk_ramp_frames == [1, 4]
 
     scheduler = new_scheduler(
         random_codec,
         num_slots=config.stage_factory_kwargs(CODE2WAV_STAGE)["num_decode_slots"],
         max_batch_size=factory.max_batch_size,
-        max_graph_frames=factory.max_graph_frames,
+        max_graph_frames=config.stage_factory_kwargs(CODE2WAV_STAGE)[
+            "max_graph_frames"
+        ],
     )
     assert scheduler.decode_slots.num_slots == DEFAULT_LM_MAX_RUNNING_REQUESTS
     assert scheduler.can_batch_stream_chunks
@@ -817,7 +920,7 @@ def test_config_enables_batching_by_default(random_codec: MimiCodec) -> None:
 
 
 def pending_depth(scheduler) -> int:
-    return sum(len(state.pending_chunks) for state in scheduler.stream_states.values())
+    return sum(state.pending_frames for state in scheduler.stream_states.values())
 
 
 def test_sustained_multi_chunk_batches_do_not_grow_the_backlog(
@@ -825,8 +928,7 @@ def test_sustained_multi_chunk_batches_do_not_grow_the_backlog(
 ) -> None:
     # Each call stands for one message batch while the inbox never drains, so
     # the ready-work branch never runs between calls. A batch carries several
-    # chunks of the same request, and the two requests use different chunk
-    # widths, so they never share a step.
+    # chunks of the same request, including transport messages with two frames.
     codec = random_codec
     rounds = 3
     scheduler = new_scheduler(codec, num_slots=2, max_batch_size=8)
@@ -839,7 +941,9 @@ def test_sustained_multi_chunk_batches_do_not_grow_the_backlog(
         items = [
             (
                 "a",
-                SimpleNamespace(
+                StreamItem(
+                    chunk_id=0,
+                    from_stage="lm",
                     data=codes["a"][4 * round_index + i : 4 * round_index + i + 1],
                     metadata=None,
                 ),
@@ -848,7 +952,9 @@ def test_sustained_multi_chunk_batches_do_not_grow_the_backlog(
         ] + [
             (
                 "b",
-                SimpleNamespace(
+                StreamItem(
+                    chunk_id=0,
+                    from_stage="lm",
                     data=codes["b"][
                         8 * round_index + 2 * i : 8 * round_index + 2 * i + 2
                     ],
@@ -859,7 +965,7 @@ def test_sustained_multi_chunk_batches_do_not_grow_the_backlog(
         ]
         scheduler.on_stream_chunk_batch(items)
         depths.append(pending_depth(scheduler))
-    # One step per message batch would leave 7, 14, 21 chunks pending here.
+    # One step per message batch leaves frames pending and cannot keep up.
     assert depths == [0] * rounds
 
     streamed: dict[str, list[torch.Tensor]] = {"a": [], "b": []}
@@ -881,15 +987,22 @@ def test_sustained_multi_chunk_batches_do_not_grow_the_backlog(
 def test_new_arrivals_cannot_starve_a_backlogged_stream(
     random_codec: MimiCodec,
 ) -> None:
-    scheduler = new_scheduler(random_codec, num_slots=3, max_batch_size=2)
-    long_codes = random_codes(6, 61)
+    scheduler = new_scheduler(
+        random_codec, num_slots=3, max_batch_size=2, chunk_ramp_frames=(2, 1)
+    )
+    long_codes = random_codes(7, 61)
     start_stream(scheduler, "long")
-    feed_batched(scheduler, [("long", long_codes[0:1])])
+    feed_batched(scheduler, [("long", long_codes[0:2])])
     with scheduler.state_lock:
-        for frame in range(1, 6):
-            scheduler.ingest_chunk(
+        for frame in range(2, 7):
+            scheduler.ingest_stream_item(
                 "long",
-                SimpleNamespace(data=long_codes[frame : frame + 1], metadata=None),
+                StreamItem(
+                    chunk_id=0,
+                    from_stage="lm",
+                    data=long_codes[frame : frame + 1],
+                    metadata=None,
+                ),
             )
 
     long_decode_steps: list[int] = []
@@ -901,9 +1014,14 @@ def test_new_arrivals_cannot_starve_a_backlogged_stream(
         short_id = f"short-{step}"
         start_stream(scheduler, short_id)
         with scheduler.state_lock:
-            scheduler.ingest_chunk(
+            scheduler.ingest_stream_item(
                 short_id,
-                SimpleNamespace(data=random_codes(2, 100 + step), metadata=None),
+                StreamItem(
+                    chunk_id=0,
+                    from_stage="lm",
+                    data=random_codes(2, 100 + step),
+                    metadata=None,
+                ),
             )
         short_wait_steps[short_id] = step
         scheduler.run_ready_step()
@@ -915,11 +1033,13 @@ def test_new_arrivals_cannot_starve_a_backlogged_stream(
                 short_wait_steps[message.request_id] = (
                     step - short_wait_steps[message.request_id]
                 )
-                assert scheduler.on_stream_done(message.request_id)
+                scheduler.handle_stream_done(message.request_id)
+                (result,) = drain_outbox(scheduler)
+                assert result.type == "result"
 
     # The backlogged stream is served every other step despite the churn.
     assert long_decode_steps == [0, 2, 4, 6, 8]
-    assert not scheduler.stream_states["long"].pending_chunks
+    assert not scheduler.stream_states["long"].pending_codes
     # Arrivals still get their first step within one step of arriving.
     assert all(wait <= 1 for wait in short_wait_steps.values())
 
@@ -936,7 +1056,9 @@ def test_streamed_audio_parts_do_not_pin_the_batch_buffer(
         [
             (
                 request_id,
-                SimpleNamespace(
+                StreamItem(
+                    chunk_id=0,
+                    from_stage="lm",
                     data=random_codes(1, 80 + index),
                     # a is trimmed to its caller length inside the step.
                     metadata={"num_samples": 1000} if request_id == "a" else None,
@@ -1062,3 +1184,164 @@ def test_scheduler_batches_replay_device_graphs(random_codec: MimiCodec) -> None
         for key, captured_decode in graphed.decode_slots.graphs.items()
     }
     assert replays == {(1, 1): 0, (2, 1): 2, (3, 1): 4, (4, 1): 0}
+
+
+def test_ramp_catchup_counts_frames_in_burst_messages(random_codec: MimiCodec) -> None:
+    scheduler = new_scheduler(
+        random_codec, num_slots=2, max_batch_size=2, chunk_ramp_frames=(1, 4)
+    )
+    codes = {"a": random_codes(13, 120), "b": random_codes(9, 121)}
+    scheduler.on_stream_chunk_batch(
+        [
+            (request_id, StreamItem(chunk_id=0, from_stage="lm", data=frames))
+            for request_id, frames in codes.items()
+        ]
+    )
+    # No idle-loop pump: two messages contain 22 frames, not two decode steps.
+    assert pending_depth(scheduler) == 0
+    messages = drain_outbox(scheduler)
+    for request_id, frames in codes.items():
+        waveform = torch.cat(
+            [
+                decode_waveform(message.data)
+                for message in messages
+                if message.request_id == request_id
+            ]
+        )
+        torch.testing.assert_close(
+            waveform, random_codec.decode(frames.T[None])[0, 0], atol=1e-5, rtol=1e-5
+        )
+
+
+@pytest.mark.parametrize("max_graph_frames", [0, 4])
+@pytest.mark.accelerator
+@pytest.mark.skipif(
+    not current_platform.enable_codec_decode_graph(),
+    reason="requires codec device graphs",
+)
+def test_ramp_batch_waiting_tail_and_slot_reuse_past_ring(
+    random_codec: MimiCodec, max_graph_frames: int
+) -> None:
+    codec = random_codec.cuda()
+    scheduler = new_scheduler(
+        codec,
+        num_slots=2,
+        max_batch_size=2,
+        max_graph_frames=max_graph_frames,
+        chunk_ramp_frames=(1, 4),
+    )
+    assert len(scheduler.decode_slots.graphs) == 2 * max_graph_frames
+    codes = {
+        "a": random_codes(160, 130),
+        "b": random_codes(151, 131),
+        "waiting": random_codes(10, 132),
+    }
+    for request_id in ("a", "b"):
+        start_stream(scheduler, request_id)
+    messages = []
+    shapes = []
+    original = scheduler.decode_slots.decode_step
+
+    def record(codes, slots):
+        shapes.append((codes.shape[0], codes.shape[-1]))
+        return original(codes, slots)
+
+    scheduler.decode_slots.decode_step = record
+    for tick in range(160):
+        items = []
+        for request_id, start in (("a", 0), ("b", 8)):
+            frame = tick - start
+            if 0 <= frame < len(codes[request_id]):
+                items.append(
+                    (
+                        request_id,
+                        StreamItem(
+                            chunk_id=frame,
+                            from_stage="lm",
+                            data=codes[request_id][frame : frame + 1],
+                        ),
+                    )
+                )
+        if tick == 12:
+            items.append(
+                (
+                    "waiting",
+                    StreamItem(chunk_id=0, from_stage="lm", data=codes["waiting"]),
+                )
+            )
+        scheduler.on_stream_chunk_batch(items)
+        if tick == 12:
+            assert scheduler.stream_states["waiting"].slot_index is None
+            assert scheduler.stream_states["waiting"].pending_frames == 10
+            scheduler.handle_stream_done("waiting")
+        for request_id, start in (("a", 0), ("b", 8)):
+            if tick == start + len(codes[request_id]) - 1:
+                scheduler.handle_stream_done(request_id)
+        while scheduler.has_ready_work():
+            scheduler.run_ready_step()
+        messages.extend(drain_outbox(scheduler))
+    assert (2, 4) in shapes
+    assert {width for _, width in shapes} >= {1, 2, 3, 4}
+    assert scheduler.decode_slots.active_slot_count == 0
+    assert not any(message.type == "error" for message in messages)
+    assert not any(
+        message.type == "result" and message.request_id == "waiting"
+        for message in messages
+    )
+    payload = StagePayload(
+        "waiting",
+        request=OmniRequest(inputs={}),
+        data=PersonaPlexState(codes=codes["waiting"]).to_dict(),
+    )
+    scheduler.handle_streaming_new_request("waiting", payload)
+    messages.extend(drain_outbox(scheduler))
+    assert scheduler.stream_states == {}
+    for request_id, frames in codes.items():
+        ordered = [message for message in messages if message.request_id == request_id]
+        assert ordered[-1].type == "result"
+        assert all(message.type == "stream" for message in ordered[:-1])
+        streamed = torch.cat(
+            [decode_waveform(message.data) for message in ordered[:-1]]
+        )
+        torch.testing.assert_close(
+            streamed, decode_waveform(ordered[-1].data.data), atol=0, rtol=0
+        )
+        # Compare the same fixed codes to a whole-utterance decode, independent of scheduling.
+        reference = codec.decode(frames.T[None].cuda())[0, 0].float().cpu()
+        assert streamed.shape == reference.shape
+        assert (streamed - reference).abs().max() <= 0.05 * reference.abs().max()
+
+
+def test_ramp_shutdown_and_late_chunks_release_all_slots(
+    random_codec: MimiCodec,
+) -> None:
+    scheduler = new_scheduler(
+        random_codec, num_slots=1, max_batch_size=2, chunk_ramp_frames=(1, 4)
+    )
+    codes = random_codes(4, 133)
+    scheduler.on_stream_chunk_batch(
+        [
+            (request_id, StreamItem(chunk_id=0, from_stage="lm", data=codes))
+            for request_id in ("a", "b")
+        ]
+    )
+    assert scheduler.decode_slots.active_slot_count == 1
+    assert scheduler.stream_states["b"].slot_index is None
+    scheduler.stop()
+    assert scheduler.stream_states == {}
+    assert scheduler.decode_slots.active_slot_count == 0
+
+    scheduler = new_scheduler(
+        random_codec, num_slots=1, max_batch_size=2, chunk_ramp_frames=(1, 4)
+    )
+    start_stream(scheduler, "done")
+    deliver_chunk(
+        scheduler, "done", StreamItem(chunk_id=0, from_stage="lm", data=codes[:1])
+    )
+    scheduler.handle_stream_done("done")
+    drain_outbox(scheduler)
+    deliver_chunk(
+        scheduler, "done", StreamItem(chunk_id=1, from_stage="lm", data=codes[1:])
+    )
+    assert scheduler.stream_states == {}
+    assert scheduler.decode_slots.active_slot_count == 0

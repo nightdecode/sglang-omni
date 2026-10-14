@@ -364,7 +364,9 @@ only records timestamps; every metric definition lives in
 
 - `first_partial_latency_s`: per segment, from the send time of the packet that
   reached the server's first refresh point (`segment_start + decode_interval_ms`)
-  to the first partial `transcription.segment`.
+  to the first partial `transcription.segment`. `segment_start` is the
+  `audio_start_ms` carried by the segment's own events, so segments opened by
+  a hard cut are measured from the cut.
 - `partial_interval_s`: gaps between consecutive partials of one segment.
 - `final_latency_s`: `input_audio_buffer.committed` to the segment's final event.
 - `done_to_completed_s`: `transcription.done` sent to `transcription.completed`.
@@ -587,6 +589,17 @@ python -m benchmarks.eval.benchmark_duplex_v15 record \
     --output results/minicpmo-v15 --timeout 90
 ```
 
+`--concurrency N` processes up to N variants at once, including post-processing.
+Connections above the server's `max_sessions` may receive HTTP 503; a session
+fails if admission retries are exhausted. Latencies recorded under load are not
+comparable to N=1, and `run.json` gains a `load`
+block (p50/p90/max initial delay, pacing violations, admission diagnostics).
+`load.input_pacing_violations` counts variants with measured out-of-tolerance
+appends; a session that sends no appends is excluded. The
+`load.variants_with_admission_denials` count includes each variant with recorded
+HTTP 503 admission denials once, even if a retry succeeds and the variant passes.
+Final outcomes remain in `summary.variants` and `load.variants_passed`.
+
 Pin the server and model revisions separately. Sending 80 ms transport packets
 does not change MiniCPM-o's one-second native processing unit. The v1.5 scoring
 commands below retain their documented measurement scope; adding a model
@@ -643,6 +656,11 @@ python -m benchmarks.eval.benchmark_duplex_v10 score \
     --transcripts results/fdb10-asr \
     [--backchannel-reference icc_gt_distribution.json]
 ```
+
+`record --concurrency N` processes up to N variants at once, including
+post-processing. Connections above the server's capacity are retried on HTTP
+503. Latencies recorded under load are not comparable to N=1, and `run.json` gains a
+`load` block with the same metric definitions as the v1.5 recorder above.
 
 `score` (`fdb-v10-synthetic-v4`) reports per-task takeover rate and latency
 from the ASR word timestamps. A takeover is output lasting at least 1 s or

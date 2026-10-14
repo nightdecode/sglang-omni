@@ -49,11 +49,15 @@ class MimiDecodeSlots:
         num_slots: int,
         max_batch_size: int,
         max_graph_frames: int,
+        max_chunk_frames: int,
     ) -> None:
         self.codec = codec
         self.num_slots = num_slots
         self.max_batch_size = max_batch_size
-        self.decode_state = codec.init_decode_state(batch_size=num_slots)
+        self.max_chunk_frames = max(max_chunk_frames, max_graph_frames)
+        self.decode_state = codec.init_decode_state(
+            batch_size=num_slots, max_chunk_frames=self.max_chunk_frames
+        )
         self.free_slots = list(reversed(range(num_slots)))
         self.graphs: dict[tuple[int, int], CapturedDecode] = {}
         device = codec.device
@@ -152,6 +156,7 @@ class MimiDecodeSlots:
         the next step.
         """
         assert codes_BKF.shape[0] == len(slot_indices) == len(set(slot_indices))
+        assert 0 < codes_BKF.shape[-1] <= self.max_chunk_frames
         captured_decode = self.graphs.get((len(slot_indices), codes_BKF.shape[-1]))
         if captured_decode is None:
             rows = torch.tensor(

@@ -1147,7 +1147,6 @@ def test_moss_tts_maps_references_token_count_and_checkpoint_defaults() -> None:
             "text": "${token:120}hello [pause 0.5s] ni3 hao3 /hello/",
             "references": [{"audio_path": "voice.wav", "text": "reference"}],
         },
-        params={"temperature": 0.8, "top_p": 0.8, "top_k": 30},
         tts_params={"language": "en"},
     )
 
@@ -1319,10 +1318,7 @@ def test_moss_tts_preserves_explicit_standard_sampling_values() -> None:
     payload = make_payload(
         inputs="hello",
         params={"temperature": 0.7, "top_p": 0.9, "top_k": 40},
-        tts_params={
-            "explicit_generation_params": ["temperature", "top_p", "top_k"],
-            "token_count": 42,
-        },
+        tts_params={"token_count": 42},
     )
 
     state = build_moss_tts_state(payload)

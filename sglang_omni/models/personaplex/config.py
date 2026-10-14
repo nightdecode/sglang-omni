@@ -2,9 +2,9 @@
 """The PersonaPlex pipeline: five stages on one GPU, the LM under SGLang."""
 
 from collections.abc import Mapping
-from typing import ClassVar
+from typing import Annotated, ClassVar
 
-from pydantic import Field
+from pydantic import Field, PositiveInt
 
 from sglang_omni.config.schema import (
     EngineArgs,
@@ -34,7 +34,10 @@ class PersonaPlexCode2WavFactoryArgs(FactoryArgs):
 
     num_decode_slots: int | None = Field(default=None, ge=1)
     max_batch_size: int = Field(default=8, ge=1)
-    max_graph_frames: int = Field(default=1, ge=0)
+    max_graph_frames: int | None = Field(default=None, ge=0)
+    chunk_ramp_frames: list[Annotated[PositiveInt, Field(strict=True)]] = Field(
+        default_factory=lambda: [1, 4], min_length=1
+    )
 
 
 class PersonaPlexCode2WavStageConfig(StageConfig):
@@ -123,7 +126,12 @@ class PersonaPlexPipelineConfig(PipelineConfig):
         if stage_name == CODE2WAV_STAGE:
             # Note (nightdecode): Match LM concurrency. Streams whose lifetimes
             # overlap while tail audio drains wait for a decode slot.
-            return {"num_decode_slots": self.lm_max_running_requests()}
+            return {
+                "num_decode_slots": self.lm_max_running_requests(),
+                "max_graph_frames": max(
+                    self.stage_named(CODE2WAV_STAGE).factory.chunk_ramp_frames
+                ),
+            }
         else:
             return super().stage_factory_kwargs(stage_name)
 

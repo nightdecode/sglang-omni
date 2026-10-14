@@ -152,19 +152,11 @@ def test_voxtral_radix_cache_is_namespaced_by_voice() -> None:
 def test_voxtral_speech_validation_accepts_supported_fields() -> None:
     stages.validate_voxtral_speech_params(
         inputs="hello",
-        params={
-            "max_new_tokens": 128,
-            "temperature": 0.8,
-            "top_p": 0.8,
-            "top_k": 30,
-            "repetition_penalty": 1.1,
-            "stream": True,
-        },
+        params={"max_new_tokens": 128, "stream": True},
         tts_params={
             "voice": "cheerful_female",
             "response_format": "wav",
             "speed": 1.0,
-            "explicit_generation_params": ["max_new_tokens"],
         },
     )
 
@@ -172,13 +164,8 @@ def test_voxtral_speech_validation_accepts_supported_fields() -> None:
 @pytest.mark.parametrize(
     ("params", "tts_params", "inputs", "field"),
     [
-        (
-            {"temperature": 0.2},
-            {"explicit_generation_params": ["temperature"]},
-            "hello",
-            "temperature",
-        ),
-        ({}, {"explicit_generation_params": ["seed"], "seed": 7}, "hello", "seed"),
+        ({"temperature": 0.2}, {}, "hello", "temperature"),
+        ({"seed": 7}, {"seed": 7}, "hello", "seed"),
         ({}, {"language": "en"}, "hello", "language"),
         ({}, {"ref_audio": "ref.wav"}, "hello", "ref_audio"),
         (

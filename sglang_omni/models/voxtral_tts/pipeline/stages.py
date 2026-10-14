@@ -49,21 +49,12 @@ def validate_voxtral_speech_params(
     params: Mapping[str, object],
     tts_params: Mapping[str, object],
 ) -> None:
-    explicit_generation_params = tts_params.get("explicit_generation_params")
-    if isinstance(explicit_generation_params, (list, tuple, set)):
-        explicit_fields = {str(field) for field in explicit_generation_params}
-    else:
-        explicit_fields = set()
     unsupported: set[str] = set()
-    for field in explicit_fields:
-        if field != "max_new_tokens":
+    for field in ("temperature", "top_p", "top_k", "repetition_penalty", "seed"):
+        if params.get(field) is not None:
             unsupported.add(field)
         else:
             pass
-    if params.get("seed") is not None:
-        unsupported.add("seed")
-    else:
-        pass
     if params.get("stage_sampling"):
         unsupported.add("stage_sampling")
     else:

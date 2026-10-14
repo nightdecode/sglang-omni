@@ -76,11 +76,7 @@ from sglang_omni.http.admin_auth import (
     resolve_admin_api_key,
 )
 from sglang_omni.http.favicon import register_favicon
-from sglang_omni.proto import EXPLICIT_STAGE_SAMPLING_PARAMS_KEY
 from sglang_omni.proto.admin import AdminResponse
-from sglang_omni.serve.generation_params import (
-    record_explicit_generation_params as _record_explicit_generation_params,
-)
 from sglang_omni.serve.openai_errors import generation_error_status_code
 from sglang_omni.serve.protocol import (
     DEFAULT_TTS_BATCH_MAX_ITEMS,
@@ -220,6 +216,7 @@ def create_app(
     speech_reference_text_excludes_instructions: bool = False,
     additional_speech_languages: frozenset[str] = frozenset(),
     max_speech_input_chars: int | None = MAX_SPEECH_INPUT_CHARS,
+    supported_speech_fields: frozenset[str] | None = None,
     enable_realtime: bool = False,
     realtime_deployment: RealtimeDeployment | None = None,
     supports_realtime_audio_output: bool = False,
@@ -253,6 +250,9 @@ def create_app(
         additional_speech_languages: Pipeline-specific accepted languages.
         max_speech_input_chars: Maximum accepted input characters, or ``None``
             to defer length validation to model-specific context checks.
+        supported_speech_fields: Speech request fields the pipeline accepts;
+            other and unknown fields are refused before parsing. None accepts
+            every protocol field and ignores unknown ones.
         enable_realtime: If True, mount the WebSocket ``/v1/realtime``
             endpoint (OpenAI Realtime API).
         supports_realtime_audio_output: Whether the mounted realtime endpoint
@@ -318,6 +318,7 @@ def create_app(
         ),
         additional_speech_languages=additional_speech_languages,
         max_speech_input_chars=max_speech_input_chars,
+        supported_speech_fields=supported_speech_fields,
         allowed_local_media_path=allowed_local_media_path,
         allowed_media_domains=allowed_media_domains,
         voice_store=app.state.speaker_sample_store,
@@ -1057,23 +1058,6 @@ async def chat_stream_events(
     yield f"data: {STREAM_DONE_SENTINEL}\n\n"
 
 
-def explicit_generation_params(
-    request: ChatCompletionRequest | RolloutSamplingParams,
-) -> list[str]:
-    fields_set = getattr(request, "model_fields_set", set())
-    return sorted(
-        field
-        for field in (
-            "max_new_tokens",
-            "temperature",
-            "top_p",
-            "top_k",
-            "repetition_penalty",
-        )
-        if field in fields_set and getattr(request, field, None) is not None
-    )
-
-
 def build_chat_generate_request(req: ChatCompletionRequest) -> GenerateRequest:
     """Convert a ChatCompletionRequest into a client GenerateRequest."""
     # Parse stop sequences
@@ -1087,13 +1071,11 @@ def build_chat_generate_request(req: ChatCompletionRequest) -> GenerateRequest:
 
     # Build sampling params
     sampling = SamplingParams(
-        temperature=req.temperature if req.temperature is not None else 1.0,
-        top_p=req.top_p if req.top_p is not None else 1.0,
-        top_k=req.top_k if req.top_k is not None else -1,
-        min_p=req.min_p if req.min_p is not None else 0.0,
-        repetition_penalty=(
-            req.repetition_penalty if req.repetition_penalty is not None else 1.0
-        ),
+        temperature=req.temperature,
+        top_p=req.top_p,
+        top_k=req.top_k,
+        min_p=req.min_p,
+        repetition_penalty=req.repetition_penalty,
         stop=stop,
         seed=req.seed,
         max_new_tokens=req.effective_max_tokens,
@@ -1135,12 +1117,6 @@ def build_chat_generate_request(req: ChatCompletionRequest) -> GenerateRequest:
 
     # Merge audio config, audios, images, and videos into metadata
     metadata: dict[str, object] = {}
-    if req.stage_sampling:
-        metadata[EXPLICIT_STAGE_SAMPLING_PARAMS_KEY] = {
-            name: list(params) for name, params in req.stage_sampling.items()
-        }
-    else:
-        pass
     if req.audio:
         metadata["audio_config"] = req.audio
     else:
@@ -1181,10 +1157,6 @@ def build_chat_generate_request(req: ChatCompletionRequest) -> GenerateRequest:
         metadata["use_audio_in_video"] = req.use_audio_in_video
     else:
         pass
-    _record_explicit_generation_params(
-        metadata,
-        explicit_generation_params(req),
-    )
 
     extra_params: dict[str, int | float] = {}
     for field_name, value in (
@@ -1317,22 +1289,6 @@ def build_rollout_generate_request(req: RolloutGenerateRequest) -> GenerateReque
         "return_indexer_topk": req.return_indexer_topk,
     }
     metadata = dict(req.metadata) if req.metadata else {}
-    if req.stage_sampling:
-        metadata[EXPLICIT_STAGE_SAMPLING_PARAMS_KEY] = {
-            name: sorted(
-                {
-                    "max_new_tokens" if key == "max_tokens" else key
-                    for key in params.model_fields_set
-                }
-            )
-            for name, params in req.stage_sampling.items()
-        }
-    else:
-        pass
-    _record_explicit_generation_params(
-        metadata,
-        explicit_generation_params(req.sampling_params),
-    )
 
     return GenerateRequest(
         model=req.model,
@@ -1618,14 +1574,25 @@ def register_speech(app: FastAPI) -> None:
             "X-Finish-Reason": result.finish_reason,
         }
         if result.usage is not None:
-            if result.usage.prompt_tokens is not None:
-                headers["X-Prompt-Tokens"] = str(result.usage.prompt_tokens)
-            else:
-                pass
-            if result.usage.completion_tokens is not None:
-                headers["X-Completion-Tokens"] = str(result.usage.completion_tokens)
-            else:
-                pass
+            headers.update(
+                {
+                    name: str(tokens)
+                    for name, tokens in (
+                        ("X-Prompt-Tokens", result.usage.prompt_tokens),
+                        ("X-Completion-Tokens", result.usage.completion_tokens),
+                        (
+                            "X-SGLang-Omni-Input-Tokens",
+                            result.usage.prompt_tokens,
+                        ),
+                        (
+                            "X-SGLang-Omni-Output-Tokens",
+                            result.usage.completion_tokens,
+                        ),
+                        ("X-SGLang-Omni-Total-Tokens", result.usage.total_tokens),
+                    )
+                    if tokens is not None
+                }
+            )
             if result.usage.engine_time_s is not None:
                 headers["X-Engine-Time"] = str(result.usage.engine_time_s)
             else:
