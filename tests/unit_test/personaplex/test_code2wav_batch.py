@@ -682,6 +682,36 @@ def test_a_failing_step_aborts_only_its_participants(random_codec: MimiCodec) ->
     )
 
 
+@pytest.mark.parametrize("bad_code", [-1, 2048])
+def test_out_of_range_codes_fail_only_their_request(
+    random_codec: MimiCodec, bad_code: int
+) -> None:
+    scheduler = new_scheduler(random_codec, num_slots=2, max_batch_size=2)
+    codes = random_codes(5, 35)
+    bad_codes = codes[:1].clone()
+    bad_codes[0, 3] = bad_code
+    for request_id in ("good", "bad"):
+        start_stream(scheduler, request_id)
+    shapes = record_shapes(scheduler)
+
+    # Both first frames arrive in one message batch, so they would share a step.
+    deliver(scheduler, [("good", codes[:1]), ("bad", bad_codes)])
+    deliver(scheduler, [("good", codes[1:5])])
+    scheduler.handle_stream_done("good")
+    messages = run_until_idle(scheduler)
+
+    assert [m.request_id for m in messages if m.type == "error"] == ["bad"]
+    assert shapes == [(1, 1), (1, 4)]
+    torch.testing.assert_close(
+        result_audio(messages, "good"),
+        whole_decode(random_codec, codes),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    assert scheduler.stream_states == {}
+    assert scheduler.decode_slots.active_slot_count == 0
+
+
 def test_shutdown_and_late_chunks_release_every_slot(
     random_codec: MimiCodec,
 ) -> None:

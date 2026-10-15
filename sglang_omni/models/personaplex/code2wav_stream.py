@@ -19,6 +19,7 @@ import torch
 
 from sglang_omni.models.personaplex.architecture import (
     AUDIO_CODEBOOKS_PER_STREAM,
+    MIMI,
     SAMPLE_RATE,
 )
 from sglang_omni.models.personaplex.mimi_decode_graph import MimiDecodeSlots
@@ -188,6 +189,12 @@ class PersonaPlexCode2WavScheduler(StreamingVocoderBase[StreamState, int]):
         ):
             raise ValueError(
                 f"PersonaPlex codes for {request_id!r} must have shape [frames, 8] with frames > 0"
+            )
+        elif chunk.min() < 0 or chunk.max() >= MIMI.codebook_size:
+            # Note (nightdecode): Reject the request before its codes join a batched step;
+            # an out-of-range code there fails every row, and on CUDA the whole process.
+            raise ValueError(
+                f"PersonaPlex codes for {request_id!r} must lie in [0, {MIMI.codebook_size})"
             )
         else:
             return chunk.to(dtype=torch.long)
