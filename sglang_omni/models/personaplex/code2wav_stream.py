@@ -63,6 +63,7 @@ class StreamState:
     num_samples: int = 0
     stream_done: bool = False
     ready_order: int = 0
+    client_streams: bool = False
 
 
 class PersonaPlexCode2WavScheduler(StreamingVocoderBase[StreamState, int]):
@@ -145,10 +146,11 @@ class PersonaPlexCode2WavScheduler(StreamingVocoderBase[StreamState, int]):
     def ingest_stream_item(
         self, request_id: str, item: StreamItem
     ) -> StreamState | None:
-        # note (nightdecode): LM chunks carry no public stream flag; adapt only this internal edge.
+        # note (nightdecode): The base class requires a bool stream flag; a chunk
+        # without one keeps its audio, as a non-streaming client's would.
         return super().ingest_stream_item(
             request_id,
-            replace(item, metadata={**(item.metadata or {}), "stream": True}),
+            replace(item, metadata={"stream": False, **(item.metadata or {})}),
         )
 
     def latch_stream_contract(
@@ -159,11 +161,13 @@ class PersonaPlexCode2WavScheduler(StreamingVocoderBase[StreamState, int]):
         *,
         origin: str,
     ) -> None:
-        num_samples = (
-            PersonaPlexState.from_dict(source.data).num_samples
-            if isinstance(source, StagePayload)
-            else int(source.get("num_samples") or 0)
-        )
+        if isinstance(source, StagePayload):
+            num_samples = PersonaPlexState.from_dict(source.data).num_samples
+        else:
+            # Note (wilsonzheng0327): The terminal payload only arrives after the LM finishes,
+            # so the caller length and the client's stream flag travel with each chunk.
+            num_samples = int(source.get("num_samples") or 0)
+            state.client_streams = bool(source.get("stream"))
         if num_samples:
             if state.num_samples not in (0, num_samples):
                 raise ValueError(
@@ -310,7 +314,10 @@ class PersonaPlexCode2WavScheduler(StreamingVocoderBase[StreamState, int]):
             # note (nightdecode): A saved row must not retain the whole batch's CPU storage.
             waveform = waveform.clone()
             state.emitted_samples += waveform.shape[-1]
-            state.audio_parts.append(waveform)
+            if not state.client_streams:
+                state.audio_parts.append(waveform)
+            else:
+                pass
             decoded[request_id] = waveform
         if get_recorder().is_active():
             emit_event(
