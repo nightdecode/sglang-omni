@@ -70,6 +70,9 @@ Supported Models
    * - `OpenMOSS-Team/MOSS-Transcribe-Diarize <https://huggingface.co/OpenMOSS-Team/MOSS-Transcribe-Diarize>`_
      - ASR
      - Multi-speaker transcription + diarization + timestamps
+   * - `nvidia/Nemotron-3-Diarization <https://huggingface.co/nvidia/Nemotron-3-Diarization>`_
+     - Diarization
+     - Up to eight overlapping speakers for uploads and live audio (see `cookbook <cookbook/nemotron_diarization.html>`_)
    * - `openai/whisper-large-v3 <https://huggingface.co/openai/whisper-large-v3>`_
      - ASR
      - Experimental transcription and speech-to-English translation routes; see the `audio translation support matrix <basic_usage/audio_translations.html>`_
@@ -103,6 +106,7 @@ Supported Models
    :caption: Cookbook
 
    cookbook/higgs_tts.md
+   cookbook/nemotron_diarization.md
    cookbook/voxtral_tts.md
    cookbook/fishaudio_s2_pro.md
    cookbook/fishaudio_drama3.md

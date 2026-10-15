@@ -379,10 +379,20 @@ class PersonaPlexCode2WavScheduler(StreamingVocoderBase[StreamState, int]):
     def final_result_data(
         self, request_id: str, payload: StagePayload, state: StreamState
     ) -> dict[str, bytes | list[int] | str | int]:
-        waveform = torch.cat(state.audio_parts) if state.audio_parts else torch.zeros(0)
-        return audio_waveform_payload(
-            waveform, sample_rate=SAMPLE_RATE, modality="audio", source_hint=SOURCE_HINT
-        )
+        if payload.request.params.get("stream"):
+            # Note (wilsonzheng0327): A streaming client already holds every chunk; only a
+            # non-streaming client reads the reply from the result.
+            return {"modality": "audio", "sample_rate": SAMPLE_RATE}
+        else:
+            waveform = (
+                torch.cat(state.audio_parts) if state.audio_parts else torch.zeros(0)
+            )
+            return audio_waveform_payload(
+                waveform,
+                sample_rate=SAMPLE_RATE,
+                modality="audio",
+                source_hint=SOURCE_HINT,
+            )
 
 
 __all__ = ["PersonaPlexCode2WavScheduler", "trim_to_caller"]

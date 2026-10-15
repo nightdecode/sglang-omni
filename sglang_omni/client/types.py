@@ -6,7 +6,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TypedDict
+from typing import Literal, TypedDict
 
 
 class TokenUsageDict(TypedDict):
@@ -22,6 +22,26 @@ class UsageInfoDict(TokenUsageDict, total=False):
 # note (Yucheng Hu): finish reason reported on speech surfaces when the model
 # did not say how generation ended.
 UNKNOWN_FINISH_REASON = "unknown"
+
+
+@dataclass(frozen=True, kw_only=True)
+class DiarizationSegment:
+    """One speaker's active interval, in seconds from the recording start."""
+
+    start: float
+    end: float
+    speaker: str
+
+
+@dataclass(frozen=True, kw_only=True)
+class DiarizationResult:
+    """Standalone speaker activity, with overlapping intervals permitted."""
+
+    duration: float
+    segments: list[DiarizationSegment]
+
+
+DiarizationOperation = Literal["open", "append", "finish", "close", "reset"]
 
 
 @dataclass
@@ -170,6 +190,7 @@ class GenerateChunk:
     language: str | None = None
     audio_data: object = None
     sample_rate: int | None = None
+    diarization: DiarizationResult | None = None
 
     @property
     def reported_finish_reason(self) -> str:
@@ -243,6 +264,7 @@ class CompletionResult:
     omni_rollout: dict[str, object] | None = None
     weight_version: str | None = None
     language: str | None = None
+    diarization: DiarizationResult | None = None
 
 
 @dataclass

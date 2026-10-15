@@ -77,6 +77,7 @@ from sglang_omni.http.admin_auth import (
 )
 from sglang_omni.http.favicon import register_favicon
 from sglang_omni.proto.admin import AdminResponse
+from sglang_omni.serve.diarizations import register_diarizations
 from sglang_omni.serve.openai_errors import generation_error_status_code
 from sglang_omni.serve.protocol import (
     DEFAULT_TTS_BATCH_MAX_ITEMS,
@@ -339,6 +340,7 @@ def create_app(
     register_speech_batch(app)
     register_speech_ws(app)
     register_transcriptions(app)
+    register_diarizations(app)
     register_translations(app)
     if enable_realtime or realtime_deployment is not None:
         register_realtime(app)
